@@ -22,7 +22,7 @@ Part of an order processing system, built as three services:
 graph LR
     C[Client] -->|REST| O[order-service]
     O -->|gRPC| I[inventory-service]
-    O -->|OrderCreated / RabbitMQ| N[notification-service]
+    I -->|RabbitMQ| N[notification-service]
 ```
 
 | Service | Responsibility | Exposes |
@@ -69,13 +69,16 @@ pretending to be two.
 
 All three services live in a single repository.
 
-**It is a showcase.** A reader opens one repository and sees the whole system.
+**It is a showcase.** A reader opens one repository and sees the whole system — how
+the services are split, how they talk, and how the pieces fit.
 
 **When I would decide differently.** Separate repositories pay off when separate teams
 need to release on their own schedule — several teams owning services independently,
 services written in different languages, or genuinely different release cadences. Then
 separate repositories, and a schema registry such as Buf's BSR, start to pay for
-themselves.
+themselves. None of that holds here: for around five backend developers, ten
+repositories for ten services means ten CI pipelines, ten sets of dependency updates,
+and ten places to change when something shared moves. Real cost, no benefit.
 
 ---
 
@@ -93,7 +96,7 @@ API it serves — the definition of the inventory API would sit outside inventor
 
 **Copy the contract into every service that needs it.** Each service keeps its own copy
 of the `.proto` file. This works on day one and needs no shared code at all. But there
-is no longer a single source of truth, so the copies drift.
+is no longer a single source of truth, so the copies drift — and nothing tells you.
 
 ### What is used instead
 
@@ -105,10 +108,11 @@ order-service/
   go.mod                    ← the service itself (database, queue, HTTP, ...)
   api/
     go.mod                  ← the public API, and nothing else
-    openapi/order/v1.yaml   inbound REST contract
-    proto/order/v1/
-      events.proto          outbound OrderCreated message
-    gen/order/v1/           generated Go code (committed to git)
+    proto/inventory/v1/
+      service.proto         gRPC methods
+      events.proto          RabbitMQ message shapes
+      types.proto           types shared by both
+    gen/                    generated Go code (committed to git)
     topology.go             exchange and routing key names
 ```
 
@@ -125,12 +129,17 @@ and gets the client, the message types, and nothing else.
 
 ### What this gives us
 
-**The service owns its API.** The contract lives in the service's own folder.
+**The service owns its API.** The contract lives in the service's own folder, so one
+line in `CODEOWNERS` makes that ownership real rather than a convention.
 
-**One place for everything a service exposes.** OpenAPI descriptions, gRPC methods,
-RabbitMQ messages, generated Go types, and topology names live under the owning
-service's `api/`. If inventory later adds a REST API or Kafka events, they go there
-too. Anyone asking "what can I ask this service for?" has exactly one place to look.
+**One place for everything a service exposes.** gRPC methods and RabbitMQ messages sit
+side by side in the same package and share the same types. If inventory later adds a
+REST API or Kafka events, they go here too. Anyone asking "what can I ask inventory
+for?" has exactly one place to look.
+
+**RabbitMQ is treated as seriously as gRPC.** The package holds both the message shape
+*and* the exchange and routing key names. If someone renames a routing key, every
+consumer stops compiling — instead of quietly receiving nothing in production.
 
 **Services stay self-contained.** Nothing outside a service defines what that service
 does, and there is no shared package that everyone has to edit.
@@ -138,6 +147,9 @@ does, and there is no shared package that everyone has to edit.
 **Versioning is simple.** Adding a field or a method breaks nobody, so it is just a
 commit. A genuinely breaking change gets a new folder — `inventory/v2` alongside `v1`.
 The server answers both while consumers move across, then `v1` is deleted.
+
+**Consumers stay light.** Depending on inventory's API costs two libraries, so a
+service can consume several APIs without its dependency list growing.
 
 ---
 
@@ -147,66 +159,37 @@ order-service talks to Postgres, to inventory over gRPC, and to RabbitMQ. If che
 the rule *"an order cannot be confirmed without reserved stock"* requires all three to
 be running, the tests are slow and flaky, and people stop running them.
 
-So the rules live in a package that does not know any of those exist. The application
-orchestrates those rules and declares the outbound ports it needs:
+So the rules live in a package that does not know any of those exist. The domain
+declares what it needs, as an interface:
 
 ```go
-// internal/order/application — the consumer owns the interface
+// internal/order/domain — imports nothing outside the standard library
 type StockReserver interface {
-    Reserve(ctx context.Context, request ReserveStockRequest) (Reservation, error)
+    Reserve(ctx context.Context, sku string, qty int) (ReservationID, error)
 }
 ```
 
-The inventory gRPC client satisfies it. Go makes this cheap: interfaces are satisfied
-implicitly and declared where they are used rather than where they are implemented.
-The domain contains aggregates, value objects, business errors, and domain events;
-its methods do not accept `gin.Context`, `context.Context`, protobuf messages, or
-database types.
+The gRPC client satisfies it. Go makes this cheap: interfaces are satisfied
+implicitly, and are declared where they are *used* rather than where they are
+implemented. Dependencies end up pointing inward with no framework and no
+dependency-injection container.
 
 ```
 order-service/
-  api/                               the public contracts shown above
-  cmd/order/main.go                  composition root and entry point
-  migrations/                        versioned SQL migrations
+  api/                     the public contract (above)
   internal/order/
-    domain/                          aggregates and business rules
-    application/                     use cases and outbound ports
+    domain/                rules — standard library only
+    app/                   use cases — orchestrates domain and ports
     adapter/
-      in/
-        httpgin/                     Gin REST handlers
-        worker/                      outbox-relay trigger
-      out/
-        inventorygrpc/               inventory gRPC client
-        postgres/                    order and outbox persistence
-        rabbitmq/                    event publisher
-  internal/platform/
-    config/                           configuration loading
-    observability/                    logging, metrics, and tracing
-    httpserver/                       timeouts and graceful shutdown
+      http/                REST handlers        (inbound)
+      grpc/                inventory client     (outbound)
+      postgres/            order repository     (outbound)
+      rabbitmq/            outbox relay         (outbound)
+  cmd/order/main.go        the only place everything is wired together
 ```
 
-The three architectural ideas have distinct jobs here. DDD shapes the model and its
-language. Clean Architecture supplies the inward dependency rule. Hexagonal
-architecture expresses communication through application-owned ports and inbound or
-outbound adapters:
-
-```text
-Gin HTTP adapter ──> application ──> domain
-                           |
-                           v
-                     outbound ports
-                    ^       ^       ^
-                Postgres   gRPC  RabbitMQ
-```
-
-HTTP, gRPC, and RabbitMQ are transports, but the directory names use `in` and `out`
-because direction says more than mechanism. Gin is an inbound HTTP adapter; the
-inventory gRPC client is an outbound transport adapter. The handler passes
-`c.Request.Context()` into the use case; `gin.Context` never leaves `httpgin/`.
-
-`cmd/order/main.go` is the only composition root. It constructs concrete adapters and
-injects them into application use cases without a dependency-injection container.
-The result buys a concrete property:
+This is ports and adapters — also called hexagonal, and close to what clean
+architecture describes. The name matters less than the property it buys:
 
 > `go test ./internal/order/domain/...` needs no Docker, no network, and no other
 > service running.
@@ -226,9 +209,9 @@ two pieces, not four. Layering earns its cost where there are rules to protect;
 applying it everywhere by default is ceremony.
 
 **The trap.** A `domain/` package that imports nothing but holds only structs and
-getters, with all the real logic in `application/`. That looks like clean architecture
-and is not. The test is simple: **can code in `domain/` return a business error?** If
-it cannot, the rules are in the wrong place.
+getters, with all the real logic in `app/`. That looks like clean architecture and is
+not. The test is simple: **can code in `domain/` return a business error?** If it
+cannot, the rules are in the wrong place.
 
 ---
 
@@ -328,7 +311,6 @@ request:
 | `buf breaking` | a change to `v1` that would break existing consumers |
 | `buf generate` + `git diff --exit-code` | someone edited a `.proto` and forgot to regenerate |
 | import-boundary script | one service importing another service's internal code instead of its `api` package |
-| dependency-direction script | application importing an adapter, or one adapter importing another |
 | domain-purity script | any `domain/` package importing a database, network, or queue library |
 | `go test ./internal/.../domain/...` with nothing else running | the domain quietly growing a dependency on infrastructure |
 
@@ -339,12 +321,6 @@ a compiler error found in the pull request that caused it.
 ---
 
 ## Trade-offs accepted
-
-**Gin is an inbound adapter, not the architecture.** `net/http` could serve this API,
-but Gin is used deliberately to demonstrate framework-level routing, binding, and
-middleware. The cost is another dependency; containing it in `adapter/in/httpgin`
-keeps replacement local, while `net/http.Server` still owns timeouts and graceful
-shutdown.
 
 **Generated code is committed to git.** It makes diffs noisier. In exchange,
 `git clone && go build ./...` works with no extra tools installed. This is standard in
