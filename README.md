@@ -4,7 +4,7 @@ A small order processing system built as three Go services — written to show h
 think about backend architecture, not to sell a product.
 
 The code is deliberately modest in size. The reasoning behind it is the point, and it
-lives in **[Architecture.md](Architecture.md)**.
+lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ---
 
