@@ -47,7 +47,7 @@ the conditions under which I would decide differently.
 
 - Why three services — and what would tell me the boundary is wrong
 - Why one repository instead of three
-- Where the gRPC and RabbitMQ contracts live, and which service owns them
+- Where the REST, gRPC, and RabbitMQ contracts live, and which service owns them
 - How a service stays testable while depending on Postgres, gRPC, and RabbitMQ
 - What happens when a step in the middle of the flow fails
 - What CI enforces, so the document cannot quietly drift away from the code
@@ -65,7 +65,7 @@ If you only read one thing here, read that.
 | Schema tooling | [buf](https://buf.build) | generation, linting, breaking-change detection |
 | Asynchronous messaging | RabbitMQ | routing and dead-letter support without operating a log |
 | Storage | PostgreSQL via `pgx` | transactions, which the outbox depends on |
-| HTTP | standard library `net/http` | routing since Go 1.22 is enough; no framework earns its place here |
+| HTTP | [Gin](https://gin-gonic.com/) on `net/http` | keeps routing, binding, and middleware concise while remaining confined to the inbound adapter |
 | Logging | `log/slog` | structured logging in the standard library |
 | Migrations | `golang-migrate` | plain SQL, versioned |
 | Integration tests | `testcontainers-go` | real Postgres and RabbitMQ, started by the test |
@@ -73,8 +73,9 @@ If you only read one thing here, read that.
 | Local environment | Docker Compose | — |
 | CI | GitHub Actions | — |
 
-The pattern in that table is that most rows are the standard library or a single small
-dependency. Reaching for a framework is a decision that should have to justify itself.
+Gin is a deliberate showcase choice, not an application-wide abstraction. Handlers
+translate HTTP into application commands; no Gin type crosses the inbound adapter
+boundary. Server timeouts and graceful shutdown still use `net/http` directly.
 
 ---
 
@@ -83,18 +84,26 @@ dependency. Reaching for a framework is a decision that should have to justify i
 Each is argued for in [Architecture.md](Architecture.md); the short version:
 
 **Boundaries**
+
 - Service boundaries drawn around rules and failure modes, not around database tables
 - Each service owns its public API in a separate, dependency-light Go module
 - Go workspace with one module per service, so no service can reach into another's
   internals
 
 **Inside a service**
-- Ports and adapters: the domain declares interfaces, infrastructure satisfies them
-- Domain packages import only the standard library, enforced in CI
+
+- DDD models aggregates, value objects, business errors, and domain events
+- Clean Architecture keeps dependencies pointing inward: adapters to application to
+  domain
+- Hexagonal architecture: the application owns ports and infrastructure satisfies them
+- Inbound and outbound adapters are separated explicitly; HTTP and gRPC are transport
+  adapters
+- Domain packages import only the standard library and know nothing about transport or storage
 - Applied where there are rules worth protecting — deliberately *not* applied to
   notification, which has none
 
 **Across the network**
+
 - Transactional outbox, so saving an order and publishing its event cannot disagree
 - Idempotency keys on every call that changes state, so retrying is safe
 - Expiring reservations, so a failure between two steps repairs itself
@@ -113,7 +122,7 @@ Every layer is tested, and the layers are separated so that the fast tests stay 
 | **Unit — domain** | Business rules in isolation: an order cannot be confirmed without a reservation; stock never goes below zero | nothing — no Docker, no network |
 | **Unit — use cases** | Orchestration, against in-memory fakes of the ports | nothing |
 | **Integration — adapters** | Repositories against real Postgres, publisher and consumer against real RabbitMQ, including retry and dead-letter behaviour | testcontainers |
-| **Integration — contracts** | The whole workspace compiles, so every gRPC client matches its server's contract | nothing |
+| **Integration — contracts** | HTTP handlers conform to the order OpenAPI document, and the workspace compiles so every gRPC client matches its server contract | nothing |
 | **End to end** | Placing an order all the way through to a notification | Docker Compose |
 
 ```bash
@@ -137,18 +146,30 @@ Two things worth noticing:
 
 ```
 order-service/
-  api/                     public contract — proto, generated code, topology names
-    go.mod                 its own module: gRPC and protobuf, nothing else
+  api/                               public contracts, in their own Go module
+    go.mod                           gRPC and protobuf dependencies only
+    openapi/order/v1.yaml            inbound REST contract
+    proto/order/v1/events.proto      outbound OrderCreated contract
+    gen/order/v1/                    committed generated Go code
+    topology.go                      exchange and routing key names
+  cmd/order/main.go                  composition root and entry point
+  migrations/                        versioned order database migrations
   internal/order/
-    domain/                rules — standard library only
-    app/                   use cases
-    adapter/               http, grpc, postgres, rabbitmq
-  cmd/order/               wiring and entry point
+    domain/                          aggregates and business rules
+    application/                     use cases and outbound ports
+    adapter/
+      in/
+        httpgin/                     inbound REST adapter
+        worker/                      inbound trigger for the outbox relay
+      out/
+        inventorygrpc/               outbound inventory adapter
+        postgres/                    outbound persistence adapter
+        rabbitmq/                    outbound event publisher
+  internal/platform/                 config, observability, HTTP lifecycle
   go.mod
 
-inventory-service/         same shape
-notification-service/      thinner — a consumer and an email adapter, no layering it
-                           does not need
+inventory-service/                   same dependency rules, shaped around inventory
+notification-service/                thinner — no domain layering without domain rules
 
 go.work                    ties the modules together for local development
 buf.yaml                   proto workspace: lint and breaking-change rules
