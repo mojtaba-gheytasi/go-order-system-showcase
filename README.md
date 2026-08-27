@@ -128,9 +128,12 @@ Every layer is tested, and the layers are separated so that the fast tests stay 
 ```bash
 make test              # unit tests — fast, no infrastructure
 make test-integration  # adapters, against containers
-make test-e2e          # all three services, via Docker Compose
-make check             # lint, buf lint, buf breaking, import boundaries
+make check             # current local checks: Compose config, go vet, and unit tests
 ```
+
+The end-to-end, lint, buf, and import-boundary targets will be added with the
+corresponding implementation; the Makefile does not advertise placeholder checks that
+silently pass.
 
 Two things worth noticing:
 
@@ -146,6 +149,8 @@ Two things worth noticing:
 
 ```
 order-service/
+  Dockerfile                         development and production image targets
+  .air.toml                          development hot reload
   api/                               public contracts, in their own Go module
     go.mod                           gRPC and protobuf dependencies only
     openapi/order/v1.yaml            inbound REST contract
@@ -173,6 +178,8 @@ notification-service/                thinner — no domain layering without doma
 
 go.work                    ties the modules together for local development
 buf.yaml                   proto workspace: lint and breaking-change rules
+docker-compose.yml         local services and infrastructure
+Makefile                   developer entry points
 Architecture.md            the decisions, and why
 ```
 
@@ -182,10 +189,15 @@ Architecture.md            the decisions, and why
 
 ```bash
 git clone <repo> && cd go-order-system-showcase
-make up          # Postgres, RabbitMQ, and all three services
-make seed        # a few products with stock
-make demo        # place an order and watch it flow through
+make help        # show every available command
+make dev         # order service + PostgreSQL, foreground with hot reload
+make up          # same stack, detached
+make logs        # follow the order and database logs
+make db-shell    # open psql in the order database
 ```
+
+As the inventory and notification services are implemented, `make up` will grow to
+start the complete system.
 
 `go build ./...` works on a fresh clone with no code generation step — the generated
 protobuf code is committed, for [reasons explained here](Architecture.md#trade-offs-accepted).
