@@ -66,7 +66,7 @@ If you only read one thing here, read that.
 | Asynchronous messaging | RabbitMQ | routing and dead-letter support without operating a log |
 | Storage | PostgreSQL via `pgx` | transactions, which the outbox depends on |
 | HTTP | [Gin](https://gin-gonic.com/) on `net/http` | keeps routing, binding, and middleware concise while remaining confined to the inbound adapter |
-| Logging | `log/slog` | structured logging in the standard library |
+| Logging | [zerolog](https://github.com/rs/zerolog) | structured JSON |
 | Migrations | `golang-migrate` | plain SQL, versioned |
 | Integration tests | `testcontainers-go` | real Postgres and RabbitMQ, started by the test |
 | Linting | `golangci-lint` | — |
