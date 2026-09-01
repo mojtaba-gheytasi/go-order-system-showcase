@@ -176,16 +176,20 @@ dependency-injection container.
 
 ```
 order-service/
-  api/                     the public contract (above)
-  internal/order/
-    domain/                rules — standard library only
-    app/                   use cases — orchestrates domain and ports
-    adapter/
-      http/                REST handlers        (inbound)
-      grpc/                inventory client     (outbound)
-      postgres/            order repository     (outbound)
-      rabbitmq/            outbox relay         (outbound)
-  cmd/order/main.go        the only place everything is wired together
+  api/                       the public contract (above)
+  internal/
+    order/
+      domain/                rules — standard library only
+      application/           use cases — orchestrates domain and ports
+      adapter/
+        inbound/httpgin/     REST handlers
+        outbound/postgres/   order repository
+        outbound/grpc/       inventory client
+        outbound/rabbitmq/   outbox relay
+      wiring/                builds the order context
+    platform/                config, logger, database pool, HTTP server
+    bootstrap/               builds the process
+  cmd/order/main.go          turns an error into an exit code
 ```
 
 This is ports and adapters — also called hexagonal, and close to what clean
@@ -195,6 +199,30 @@ architecture describes. The name matters less than the property it buys:
 > service running.
 
 That is a claim CI can check, and it does.
+
+### Where everything is wired
+
+Something has to know that `OrderRepository` means Postgres. That knowledge sits at the
+outermost ring, in exactly two packages: `internal/order/wiring` builds the order context
+(adapters, use cases, routes), and `internal/bootstrap` builds the process around it
+(config, the pool, the HTTP server, shutdown). `main` does neither — it turns an error
+into an exit code.
+
+The split is what keeps it from growing into a mess. `internal/platform/httpserver`
+receives an already-built `http.Handler` and never learns what a use case is, so the
+inventory service reuses it verbatim. And because `wiring` returns a struct rather than a
+bare handler, the outbox relay can be added to it later without either package changing
+shape — the order context will run more than one transport.
+
+This gives a rule with teeth: **only those two packages may import both a concrete adapter
+and the application layer.** Everything else stays importable without dragging in a
+database driver, which is the enforceable form of "the domain does not depend on
+infrastructure".
+
+It is a composition root, not a service locator. Dependencies are constructed explicitly
+and passed in, so a missing one fails to compile. A registry — `container.Get("create_order")`,
+or a reflection-based container like `fx` or `dig` — hides the graph and moves wiring
+mistakes to runtime, which trades away the main thing Go offers here.
 
 Tests then stack up:
 

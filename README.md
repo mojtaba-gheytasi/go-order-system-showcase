@@ -43,7 +43,7 @@ is not worth what it costs.
 Every significant decision is written down with its alternatives, its trade-offs, and
 the conditions under which I would decide differently.
 
-**[Architecture.md](Architecture.md)** answers:
+**[ARCHITECTURE.md](ARCHITECTURE.md)** answers:
 
 - Why three services — and what would tell me the boundary is wrong
 - Why one repository instead of three
@@ -53,6 +53,41 @@ the conditions under which I would decide differently.
 - What CI enforces, so the document cannot quietly drift away from the code
 
 If you only read one thing here, read that.
+
+---
+
+## A note on starting with microservices
+
+I do not believe microservices should be the default starting point for a new
+project. I would normally begin with a modular monolith with explicit boundaries — and extract services only when there is strong evidence that doing so solves a real problem.
+
+Useful reasons for extracting a service can include:
+
+- A component needs independent scaling or deployment
+- A separate team needs release autonomy
+- A component has a different failure or concurrency profile
+- Technology or regulatory constraints require isolation
+- A module boundary has held still long enough to survive becoming a network contract
+
+Distribution is not free, and this repository pays the bill in public. The
+transactional outbox exists only because saving an order and publishing its event are
+no longer one transaction. Idempotency keys exist only because a retried network call
+is indistinguishable from a duplicate. Expiring reservations exist only because two
+services can disagree and nothing will notice. In a monolith all three are a single
+`BEGIN … COMMIT`. partial failures, eventual consistency,
+network latency, contract versioning, observability, deployment coordination, more
+complicated local development, and more expensive integration testing.
+
+A well-structured modular monolith preserves many useful boundaries without paying
+those distributed-systems costs prematurely. If its modules are genuinely isolated,
+they can later provide sensible extraction points when the need appears.
+
+This repository deliberately starts with three services because it is an architectural
+showcase. Its purpose is to demonstrate synchronous and asynchronous communication,
+service-owned data, idempotency, partial-failure handling, and eventual consistency. It
+should not be interpreted as a recommendation to begin every similarly sized
+production system with microservices. For the current feature set, a modular monolith
+would be the simpler and more practical production choice.
 
 ---
 
@@ -81,7 +116,7 @@ boundary. Server timeouts and graceful shutdown still use `net/http` directly.
 
 ## Patterns and approaches
 
-Each is argued for in [Architecture.md](Architecture.md); the short version:
+Each is argued for in [ARCHITECTURE.md](ARCHITECTURE.md); the short version:
 
 **Boundaries**
 
@@ -163,14 +198,14 @@ order-service/
     domain/                          aggregates and business rules
     application/                     use cases and outbound ports
     adapter/
-      in/
+      inbound/
         httpgin/                     inbound REST adapter
         worker/                      inbound trigger for the outbox relay
-      out/
+      outbound/
         inventorygrpc/               outbound inventory adapter
         postgres/                    outbound persistence adapter
         rabbitmq/                    outbound event publisher
-  internal/platform/                 config, observability, HTTP lifecycle
+  internal/platform/                 config, database, observability, HTTP lifecycle
   go.mod
 
 inventory-service/                   same dependency rules, shaped around inventory
@@ -189,6 +224,7 @@ Architecture.md            the decisions, and why
 
 ```bash
 git clone <repo> && cd go-order-system-showcase
+cp order-service/app.env.example order-service/app.env
 make help        # show every available command
 make dev         # order service + PostgreSQL, foreground with hot reload
 make up          # same stack, detached
@@ -196,11 +232,24 @@ make logs        # follow the order and database logs
 make db-shell    # open psql in the order database
 ```
 
+The order service requires `app.env`. The local file is ignored by Git; production
+should mount its own file at runtime rather than bake secrets into an image.
+
+Host-side migration and SQL checks use separately installed tools rather than adding
+tooling dependencies to the service module:
+
+```bash
+brew install golang-migrate
+go install github.com/houqp/sqlvet@v1.2.0
+make migrate-version
+make sqlvet
+```
+
 As the inventory and notification services are implemented, `make up` will grow to
 start the complete system.
 
 `go build ./...` works on a fresh clone with no code generation step — the generated
-protobuf code is committed, for [reasons explained here](Architecture.md#trade-offs-accepted).
+protobuf code is committed, for [reasons explained here](ARCHITECTURE.md#trade-offs-accepted).
 
 ---
 
