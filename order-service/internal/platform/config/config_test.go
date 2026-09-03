@@ -15,6 +15,9 @@ import (
 
 const validConfigFile = `ENVIRONMENT=test
 DATABASE_URL=postgres://orders:secret@database:5432/orders
+DB_MAX_OPEN_CONNS=20
+DB_MAX_IDLE_CONNS=10
+DB_CONN_MAX_LIFETIME=30m
 HTTP_SERVER_ADDRESS=:8080
 HTTP_READ_HEADER_TIMEOUT=5s
 HTTP_READ_TIMEOUT=15s
@@ -25,7 +28,7 @@ LOG_CALLER=false
 INVENTORY_GRPC_ADDRESS=inventory:50051
 `
 
-func TestLoadReadsRequiredConfigFile(t *testing.T) {
+func TestLoadReadsOptionalLocalEnvironmentFile(t *testing.T) {
 	directory := t.TempDir()
 	writeConfigFile(t, directory, validConfigFile)
 
@@ -34,6 +37,9 @@ func TestLoadReadsRequiredConfigFile(t *testing.T) {
 
 	assert.Equal(t, "test", loaded.Environment)
 	assert.Equal(t, "postgres://orders:secret@database:5432/orders", loaded.DatabaseURL)
+	assert.Equal(t, 20, loaded.DBMaxOpenConns)
+	assert.Equal(t, 10, loaded.DBMaxIdleConns)
+	assert.Equal(t, 30*time.Minute, loaded.DBConnMaxLifetime)
 	assert.Equal(t, ":8080", loaded.HTTPServerAddress)
 	assert.Equal(t, 5*time.Second, loaded.HTTPReadHeaderTimeout)
 	assert.Equal(t, 15*time.Second, loaded.HTTPReadTimeout)
@@ -68,17 +74,28 @@ func TestLoadRequiresConfigPath(t *testing.T) {
 	assert.ErrorContains(t, err, "config path is required")
 }
 
-func TestLoadRequiresConfigFile(t *testing.T) {
-	_, err := config.Load(t.TempDir())
+func TestLoadReadsEnvironmentWithoutAFile(t *testing.T) {
+	directory := t.TempDir()
+	setConfigEnvironment(t, validConfigFile)
 
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "read config file")
+	loaded, err := config.Load(directory)
+	require.NoError(t, err)
+
+	assert.Equal(t, "test", loaded.Environment)
+	assert.Equal(t, "postgres://orders:secret@database:5432/orders", loaded.DatabaseURL)
+	assert.Equal(t, 20, loaded.DBMaxOpenConns)
+	assert.Equal(t, ":8080", loaded.HTTPServerAddress)
+	require.NotNil(t, loaded.LogCaller)
+	assert.False(t, *loaded.LogCaller)
 }
 
 func TestLoadRejectsMalformedDuration(t *testing.T) {
 	directory := t.TempDir()
 	writeConfigFile(t, directory, `ENVIRONMENT=test
 DATABASE_URL=postgres://orders
+DB_MAX_OPEN_CONNS=20
+DB_MAX_IDLE_CONNS=10
+DB_CONN_MAX_LIFETIME=30m
 HTTP_SERVER_ADDRESS=:8080
 HTTP_READ_HEADER_TIMEOUT=5s
 HTTP_READ_TIMEOUT=eventually
@@ -99,6 +116,9 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	directory := t.TempDir()
 	writeConfigFile(t, directory, `ENVIRONMENT=preview
 DATABASE_URL=
+DB_MAX_OPEN_CONNS=20
+DB_MAX_IDLE_CONNS=10
+DB_CONN_MAX_LIFETIME=30m
 HTTP_SERVER_ADDRESS=:8080
 HTTP_READ_HEADER_TIMEOUT=0s
 HTTP_READ_TIMEOUT=15s
@@ -126,23 +146,37 @@ func TestLoadRejectsMissingBoolean(t *testing.T) {
 	assert.ErrorContains(t, err, "validate configuration")
 }
 
-func TestLoadRejectsUnknownConfigFileKey(t *testing.T) {
+func TestLoadIgnoresNonApplicationVariables(t *testing.T) {
 	directory := t.TempDir()
-	writeConfigFile(t, directory, validConfigFile+"UNKNOWN_SETTING=value\n")
+	writeConfigFile(t, directory, validConfigFile+"ORDER_DB_PORT=5433\n")
 
-	_, err := config.Load(directory)
+	loaded, err := config.Load(directory)
 
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "decode configuration")
+	require.NoError(t, err)
+	assert.Equal(t, "test", loaded.Environment)
 }
 
 func writeConfigFile(t *testing.T, directory, contents string) {
 	t.Helper()
 
 	err := os.WriteFile(
-		filepath.Join(directory, "app.env"),
+		filepath.Join(directory, ".env"),
 		[]byte(contents),
 		0o600,
 	)
 	require.NoError(t, err)
+}
+
+func setConfigEnvironment(t *testing.T, contents string) {
+	t.Helper()
+
+	for line := range strings.SplitSeq(contents, "\n") {
+		if line == "" {
+			continue
+		}
+
+		key, value, found := strings.Cut(line, "=")
+		require.True(t, found)
+		t.Setenv(key, value)
+	}
 }
