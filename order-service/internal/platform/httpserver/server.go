@@ -8,11 +8,11 @@ import (
 )
 
 type Config struct {
-	Address string
+	Address           string
 	ReadHeaderTimeout time.Duration
-	ReadTimeout time.Duration
-	WriteTimeout time.Duration
-	IdleTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
 }
 
 type Server struct {
@@ -42,6 +42,10 @@ func (s *Server) Start() error {
 	return err
 }
 
-func (s *Server) Shotdown(ctx context.Context) error {
-	return s.server.Shutdown(ctx)
+func (s *Server) Shutdown(ctx context.Context) error {
+	if err := s.server.Shutdown(ctx); err != nil {
+		return errors.Join(err, s.server.Close())
+	}
+
+	return nil
 }

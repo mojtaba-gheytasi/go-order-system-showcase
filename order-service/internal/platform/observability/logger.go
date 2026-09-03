@@ -15,7 +15,7 @@ type LoggerConfig struct {
 	Environment   string
 	Level         string
 	IncludeCaller bool
-	Output io.Writer
+	Output        io.Writer
 }
 
 func NewLogger(config LoggerConfig) (zerolog.Logger, error) {
