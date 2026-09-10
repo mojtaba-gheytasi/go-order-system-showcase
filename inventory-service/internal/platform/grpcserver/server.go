@@ -11,11 +11,11 @@ import (
 )
 
 type Config struct {
-	Address string
+	Address              string
 	MaxConnectionIdle    time.Duration
 	MaxConnectionAge     time.Duration
 	MaxConnectionAgeSlop time.Duration
-	UnaryInterceptors []grpc.UnaryServerInterceptor
+	UnaryInterceptors    []grpc.UnaryServerInterceptor
 }
 
 type Server struct {
