@@ -1,0 +1,22 @@
+root = "."
+tmp_dir = "/tmp/air"
+
+[build]
+cmd = "go build -mod=readonly -o /tmp/air/order ./cmd/order"
+entrypoint = ["/tmp/air/order"]
+include_ext = ["go"]
+exclude_dir = ["tmp", "vendor"]
+exclude_unchanged = true
+delay = 500
+stop_on_error = true
+send_interrupt = true
+# Air kills the child immediately after the interrupt unless it is told to wait,
+# so without this the service never gets to run its graceful shutdown in dev.
+# Quoted on purpose: a bare number is read as nanoseconds.
+kill_delay = "5s"
+
+[log]
+time = true
+
+[misc]
+clean_on_exit = true
