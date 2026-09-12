@@ -59,6 +59,21 @@ func TestReserveStockRefusesTheSameOrderIDWithDifferentProducts(t *testing.T) {
 	assert.Equal(t, 0, store.claims)
 }
 
+// Both sides travel with the refusal. The difference between them is the
+// diagnosis: it separates a basket that changed under a reused id from an id
+// that collided, and those have different fixes.
+func TestReserveStockReportsBothSidesOfAnIdempotencyConflict(t *testing.T) {
+	held := []application.Line{{ProductSKU: "SKU-A", Quantity: 99}}
+	store := &fakeStore{held: held}
+
+	err := useCase(store).Execute(context.Background(), testCommand())
+
+	var conflict *application.IdempotencyConflictError
+	require.ErrorAs(t, err, &conflict)
+	assert.Equal(t, held, conflict.Held)
+	assert.Equal(t, testCommand().Lines, conflict.Requested)
+}
+
 // Two requests carrying the same order id race; the loser's claim is refused and
 // it must answer from what the winner holds rather than failing.
 func TestReserveStockRereadsAfterLosingTheClaimRace(t *testing.T) {

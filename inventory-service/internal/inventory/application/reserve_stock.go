@@ -75,13 +75,15 @@ func (useCase *ReserveStock) Execute(ctx context.Context, command ReserveStockCo
 
 // confirmSameProducts accepts a repeat only when it asks for what is already
 // held. The same order id carrying different products is a caller mistake, and
-// reporting success would confirm stock for items nobody reserved.
-
-// Why not just guess?
-// Say "yes" always → in case B you just told order-service "your stock is held" for products nobody reserved. The order gets accepted. The warehouse never packs it, because it was never reserved. That is the worst possible bug in this service.
+// answering success would confirm stock for items nobody reserved: the order
+// would be accepted, and the warehouse would never pack it.
+//
+// Both sides travel with the refusal, because the difference between them is
+// what tells a caller whether it resubmitted a changed basket or generated a
+// colliding order id.
 func confirmSameProducts(held, requested []Line) error {
 	if slices.Equal(held, requested) == false {
-		return ErrIdempotencyConflict
+		return &IdempotencyConflictError{Held: held, Requested: requested}
 	}
 
 	return nil
