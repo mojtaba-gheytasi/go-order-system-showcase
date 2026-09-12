@@ -25,3 +25,16 @@ func TestCatalogRejectsAnUnknownProduct(t *testing.T) {
 
 	require.ErrorIs(t, err, application.ErrProductNotFound)
 }
+
+// Naming one unpriced product at a time would cost a customer an attempt per bad
+// sku, so the refusal names all of them.
+func TestCatalogNamesEveryUnknownProduct(t *testing.T) {
+	_, err := catalogstub.New().Prices(
+		context.Background(),
+		[]string{"SKU-A", "NOT-A-PRODUCT", "ALSO-NOT-A-PRODUCT"},
+	)
+
+	var notFound *application.ProductNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.Equal(t, []string{"NOT-A-PRODUCT", "ALSO-NOT-A-PRODUCT"}, notFound.ProductSKUs)
+}

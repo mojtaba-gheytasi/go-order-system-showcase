@@ -109,6 +109,9 @@ func (useCase *CreateOrder) processPersisted(
 	case domain.StatusAccepted, domain.StatusShipped, domain.StatusCancelled:
 		return CreateOrderResult{Order: order, Created: created}, nil
 	case domain.StatusRejected:
+		// A repeat of an order already refused. The stored verdict is all there
+		// is: which lines were short was inventory's answer at the time, and
+		// replaying it now would state old stock levels as current fact.
 		return CreateOrderResult{}, ErrInsufficientStock
 	case domain.StatusPending:
 		return useCase.processPending(ctx, order, created)
@@ -125,7 +128,10 @@ func (useCase *CreateOrder) processPending(
 	err := useCase.reserveInventory(ctx, reservationRequestFor(order))
 	if err != nil {
 		if errors.Is(err, ErrInsufficientStock) {
-			return useCase.reject(ctx, order, created)
+			// The refusal is carried through rather than replaced by the
+			// sentinel: whatever inventory said about which lines blocked the
+			// order is the only thing a customer can act on.
+			return useCase.reject(ctx, order, created, err)
 		}
 
 		return CreateOrderResult{}, fmt.Errorf("reserve inventory: %w", err)
@@ -148,10 +154,14 @@ func (useCase *CreateOrder) processPending(
 	return CreateOrderResult{Order: order, Created: created}, nil
 }
 
+// reject records that the order cannot be filled and hands back the refusal that
+// caused it. The order is stored as rejected either way; cause is returned
+// unchanged so that the detail inventory supplied survives being persisted.
 func (useCase *CreateOrder) reject(
 	ctx context.Context,
 	order *domain.Order,
 	created bool,
+	cause error,
 ) (CreateOrderResult, error) {
 	if err := order.Reject(useCase.clock()); err != nil {
 		return CreateOrderResult{}, fmt.Errorf("reject order: %w", err)
@@ -165,7 +175,7 @@ func (useCase *CreateOrder) reject(
 		return CreateOrderResult{}, fmt.Errorf("persist rejected order: %w", err)
 	}
 
-	return CreateOrderResult{}, ErrInsufficientStock
+	return CreateOrderResult{}, cause
 }
 
 func (useCase *CreateOrder) resultAfterConflict(
@@ -244,15 +254,26 @@ func (useCase *CreateOrder) buildOrder(
 		return nil, fmt.Errorf("resolve product prices: %w", err)
 	}
 
+	// Every unpriced product is collected before giving up, so a customer with
+	// several bad skus learns about all of them at once instead of one per
+	// attempt.
+	missing := make([]string, 0)
+	for _, commandItem := range command.Items {
+		productSKU := strings.TrimSpace(commandItem.ProductSKU)
+		if _, found := prices[productSKU]; found == false {
+			missing = append(missing, productSKU)
+		}
+	}
+
+	if len(missing) > 0 {
+		return nil, &ProductNotFoundError{ProductSKUs: missing}
+	}
+
 	items := make([]domain.OrderItem, 0, len(command.Items))
 	for _, commandItem := range command.Items {
 		productSKU := strings.TrimSpace(commandItem.ProductSKU)
-		price, found := prices[productSKU]
-		if found == false {
-			return nil, fmt.Errorf("%w: product %q", ErrProductNotFound, productSKU)
-		}
 
-		item, err := domain.NewOrderItem(productSKU, commandItem.Quantity, price)
+		item, err := domain.NewOrderItem(productSKU, commandItem.Quantity, prices[productSKU])
 		if err != nil {
 			return nil, err
 		}

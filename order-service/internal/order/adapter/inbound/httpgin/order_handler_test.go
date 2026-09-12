@@ -195,6 +195,60 @@ func TestCreateOrderMapsUseCaseFailuresOntoStatuses(t *testing.T) {
 	}
 }
 
+// Telling a customer that "one or more items" are unavailable leaves them to
+// guess which. The shortfall names the line and the quantity they could have,
+// which is what turns a dead end into a correctable request.
+func TestCreateOrderTellsTheCustomerWhichItemsAreShort(t *testing.T) {
+	response := postOrder(
+		t,
+		&fakeUseCase{err: fmt.Errorf("reserve inventory: %w", &application.InsufficientStockError{
+			Shortfalls: []application.Shortfall{
+				{ProductSKU: "SKU-SCARCE", Requested: 5, Available: 3},
+			},
+		})},
+		validBody,
+		withIdempotencyKey("demo-1"),
+	)
+
+	require.Equal(t, http.StatusConflict, response.Code)
+
+	body := decodeError(t, response.Body.Bytes())
+	assert.Equal(t, "insufficient_stock", body.Error.Code)
+	require.Len(t, body.Error.Details.Shortfalls, 1)
+	assert.Equal(t, "SKU-SCARCE", body.Error.Details.Shortfalls[0].ProductSKU)
+	assert.Equal(t, int32(5), body.Error.Details.Shortfalls[0].Requested)
+	assert.Equal(t, int32(3), body.Error.Details.Shortfalls[0].Available)
+}
+
+func TestCreateOrderNamesTheProductsThatDoNotExist(t *testing.T) {
+	response := postOrder(
+		t,
+		&fakeUseCase{err: &application.ProductNotFoundError{ProductSKUs: []string{"SKU-GHOST"}}},
+		validBody,
+		withIdempotencyKey("demo-1"),
+	)
+
+	require.Equal(t, http.StatusUnprocessableEntity, response.Code)
+
+	body := decodeError(t, response.Body.Bytes())
+	assert.Equal(t, "product_not_found", body.Error.Code)
+	assert.Equal(t, []string{"SKU-GHOST"}, body.Error.Details.ProductSKUs)
+}
+
+// An error with nothing more to say must not carry an empty details object: a
+// client has to be able to tell "nothing to add" from "nothing was wrong".
+func TestCreateOrderOmitsDetailsWhenThereAreNone(t *testing.T) {
+	response := postOrder(
+		t,
+		&fakeUseCase{err: fmt.Errorf("reserve stock: %w", application.ErrInsufficientStock)},
+		validBody,
+		withIdempotencyKey("demo-1"),
+	)
+
+	require.Equal(t, http.StatusConflict, response.Code)
+	assert.NotContains(t, response.Body.String(), "details")
+}
+
 func TestRouterEchoesAndSanitisesTheRequestID(t *testing.T) {
 	useCase := &fakeUseCase{
 		result: application.CreateOrderResult{Order: testOrder(t, true), Created: true},
@@ -245,8 +299,16 @@ func TestUnknownRouteAndMethodUseTheErrorEnvelope(t *testing.T) {
 
 type errorEnvelope struct {
 	Error struct {
-		Code      string `json:"code"`
-		Message   string `json:"message"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Details struct {
+			Shortfalls []struct {
+				ProductSKU string `json:"product_sku"`
+				Requested  int32  `json:"requested"`
+				Available  int32  `json:"available"`
+			} `json:"shortfalls"`
+			ProductSKUs []string `json:"product_skus"`
+		} `json:"details"`
 		RequestID string `json:"request_id"`
 	} `json:"error"`
 }
