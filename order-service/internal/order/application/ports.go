@@ -24,11 +24,13 @@ type ReservationRequest struct {
 	Lines   []ReservationLine
 }
 
-// InventoryReserver treats OrderID as the operation's idempotency key. Repeated
-// requests for an OrderID must return the original reservation or the original
-// insufficient-stock result without changing stock again.
+// InventoryReserver treats OrderID as the operation's idempotency key, so a
+// repeated request for the same OrderID does not hold the stock twice.
+//
+// There is nothing to return on success: inventory holds stock against the order
+// id the caller already has, so success is the whole answer.
 type InventoryReserver interface {
-	Reserve(ctx context.Context, request ReservationRequest) (domain.ReservationID, error)
+	Reserve(ctx context.Context, request ReservationRequest) error
 }
 
 type OrderNotifier interface {

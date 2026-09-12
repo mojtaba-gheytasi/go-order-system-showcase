@@ -14,7 +14,6 @@ type orderRow struct {
 	customerID         uuid.UUID
 	customerEmail      string
 	status             string
-	reservationID      uuid.NullUUID
 	idempotencyKey     string
 	totalAmountInCents int64
 	currency           string
@@ -41,18 +40,12 @@ func rowsFromDomain(order *domain.Order) (orderRow, []orderItemRow, error) {
 		return orderRow{}, nil, fmt.Errorf("parse customer id: %w", err)
 	}
 
-	reservationID, err := nullableUUID(order.ReservationID())
-	if err != nil {
-		return orderRow{}, nil, err
-	}
-
 	total := order.Total()
 	storedOrder := orderRow{
 		id:                 orderID,
 		customerID:         customerID,
 		customerEmail:      order.CustomerEmail(),
 		status:             string(order.Status()),
-		reservationID:      reservationID,
 		idempotencyKey:     order.IdempotencyKey(),
 		totalAmountInCents: total.AmountInCents,
 		currency:           total.Currency,
@@ -99,17 +92,11 @@ func domainFromRows(storedOrder orderRow, storedOrderItems []orderItemRow) (*dom
 		orderItems = append(orderItems, orderItem)
 	}
 
-	var reservationID domain.ReservationID
-	if storedOrder.reservationID.Valid {
-		reservationID = domain.ReservationID(storedOrder.reservationID.UUID.String())
-	}
-
 	order, err := domain.Reconstitute(
 		domain.OrderID(storedOrder.id.String()),
 		domain.CustomerID(storedOrder.customerID.String()),
 		storedOrder.customerEmail,
 		domain.Status(storedOrder.status),
-		reservationID,
 		storedOrder.idempotencyKey,
 		orderItems,
 		domain.Money{
@@ -124,17 +111,4 @@ func domainFromRows(storedOrder orderRow, storedOrderItems []orderItemRow) (*dom
 	}
 
 	return order, nil
-}
-
-func nullableUUID(id domain.ReservationID) (uuid.NullUUID, error) {
-	if id == "" {
-		return uuid.NullUUID{}, nil
-	}
-
-	parsed, err := uuid.Parse(string(id))
-	if err != nil {
-		return uuid.NullUUID{}, fmt.Errorf("parse reservation id: %w", err)
-	}
-
-	return uuid.NullUUID{UUID: parsed, Valid: true}, nil
 }

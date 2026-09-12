@@ -18,7 +18,6 @@ import (
 var (
 	fixedNow           = time.Date(2026, time.August, 31, 12, 0, 0, 0, time.UTC)
 	generatedID        = "018f0f38-5a52-7a01-8000-0000000000aa"
-	stubReservationID  = domain.ReservationID("018f0f38-5a52-7a01-8000-0000000000bb")
 	testCustomerID     = "018f0f38-5a52-7a01-8000-000000000020"
 	testIdempotencyKey = "create-order-1"
 )
@@ -33,7 +32,6 @@ func TestCreateOrderPersistsPendingBeforeInventoryThenAcceptsAndNotifies(t *test
 	order := result.Order
 	assert.Equal(t, domain.OrderID(generatedID), order.ID())
 	assert.Equal(t, domain.StatusAccepted, order.Status())
-	assert.Equal(t, stubReservationID, order.ReservationID())
 	assert.Equal(t, domain.Money{AmountInCents: 3000, Currency: "EUR"}, order.Total())
 	assert.Equal(t, fixedNow, order.CreatedAt())
 	assert.Equal(t, domain.StatusPending, dependencies.repository.statusAtCreate)
@@ -392,7 +390,7 @@ func acceptedOrder(
 	t.Helper()
 
 	order := pendingOrder(t, orderID, idempotencyKey, productSKU)
-	require.NoError(t, order.Accept(stubReservationID, fixedNow))
+	require.NoError(t, order.Accept(fixedNow))
 
 	return order
 }
@@ -428,7 +426,7 @@ func newDependencies() *dependencies {
 			"SKU-A": {AmountInCents: 1250, Currency: "EUR"},
 			"SKU-B": {AmountInCents: 500, Currency: "EUR"},
 		}},
-		reserver: &fakeReserver{trace: trace, reservationID: stubReservationID},
+		reserver: &fakeReserver{trace: trace},
 		notifier: &fakeNotifier{trace: trace},
 		trace:    trace,
 	}
@@ -540,12 +538,11 @@ func (repository *fakeRepository) FindByIdempotencyKey(
 }
 
 type fakeReserver struct {
-	trace         *callTrace
-	reservationID domain.ReservationID
-	results       []error
-	requests      []application.ReservationRequest
-	afterReserve  func()
-	calls         int
+	trace        *callTrace
+	results      []error
+	requests     []application.ReservationRequest
+	afterReserve func()
+	calls        int
 }
 
 var _ application.InventoryReserver = (*fakeReserver)(nil)
@@ -553,7 +550,7 @@ var _ application.InventoryReserver = (*fakeReserver)(nil)
 func (reserver *fakeReserver) Reserve(
 	_ context.Context,
 	request application.ReservationRequest,
-) (domain.ReservationID, error) {
+) error {
 	reserver.trace.record("reserve")
 	reserver.calls++
 	reserver.requests = append(reserver.requests, request)
@@ -563,10 +560,10 @@ func (reserver *fakeReserver) Reserve(
 
 	resultIndex := reserver.calls - 1
 	if resultIndex < len(reserver.results) && reserver.results[resultIndex] != nil {
-		return "", reserver.results[resultIndex]
+		return reserver.results[resultIndex]
 	}
 
-	return reserver.reservationID, nil
+	return nil
 }
 
 type fakeNotifier struct {

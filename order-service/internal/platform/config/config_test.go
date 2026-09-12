@@ -26,6 +26,7 @@ HTTP_IDLE_TIMEOUT=60s
 LOG_LEVEL=info
 LOG_CALLER=false
 INVENTORY_GRPC_ADDRESS=inventory:50051
+INVENTORY_GRPC_TIMEOUT=3s
 `
 
 func TestLoadReadsOptionalLocalEnvironmentFile(t *testing.T) {
@@ -104,6 +105,7 @@ HTTP_IDLE_TIMEOUT=60s
 LOG_LEVEL=info
 LOG_CALLER=false
 INVENTORY_GRPC_ADDRESS=inventory:50051
+INVENTORY_GRPC_TIMEOUT=3s
 `)
 
 	_, err := config.Load(directory)
@@ -127,6 +129,7 @@ HTTP_IDLE_TIMEOUT=60s
 LOG_LEVEL=verbose
 LOG_CALLER=false
 INVENTORY_GRPC_ADDRESS=inventory:50051
+INVENTORY_GRPC_TIMEOUT=3s
 `)
 
 	_, err := config.Load(directory)

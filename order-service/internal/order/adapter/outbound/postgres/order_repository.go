@@ -20,13 +20,12 @@ const (
 			customer_id,
 			customer_email,
 			status,
-			reservation_id,
 			idempotency_key,
 			total_amount_in_cents,
 			currency,
 			created_at,
 			updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
 	insertOrderItemQuery = `
 		INSERT INTO order_items (
@@ -41,9 +40,8 @@ const (
 		UPDATE orders
 		SET
 			status = $1,
-			reservation_id = $2,
-			updated_at = $3
-		WHERE id = $4 AND status = $5`
+			updated_at = $2
+		WHERE id = $3 AND status = $4`
 
 	findOrderByIDQuery = `
 		SELECT
@@ -51,7 +49,6 @@ const (
 			customer_id,
 			customer_email,
 			status,
-			reservation_id,
 			idempotency_key,
 			total_amount_in_cents,
 			currency,
@@ -66,7 +63,6 @@ const (
 			customer_id,
 			customer_email,
 			status,
-			reservation_id,
 			idempotency_key,
 			total_amount_in_cents,
 			currency,
@@ -120,7 +116,6 @@ func (repository *OrderRepository) Create(ctx context.Context, order *domain.Ord
 		storedOrder.customerID,
 		storedOrder.customerEmail,
 		storedOrder.status,
-		storedOrder.reservationID,
 		storedOrder.idempotencyKey,
 		storedOrder.totalAmountInCents,
 		storedOrder.currency,
@@ -171,7 +166,6 @@ func (repository *OrderRepository) Update(
 		ctx,
 		updateOrderStateQuery,
 		storedOrder.status,
-		storedOrder.reservationID,
 		storedOrder.updatedAt,
 		storedOrder.id,
 		string(expectedStatus),
@@ -262,7 +256,6 @@ func scanOrder(row *sql.Row) (orderRow, error) {
 		&storedOrder.customerID,
 		&storedOrder.customerEmail,
 		&storedOrder.status,
-		&storedOrder.reservationID,
 		&storedOrder.idempotencyKey,
 		&storedOrder.totalAmountInCents,
 		&storedOrder.currency,

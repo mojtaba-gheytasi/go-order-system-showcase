@@ -49,7 +49,8 @@ func TestCreateOrderReturns201WithTheCreatedOrder(t *testing.T) {
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
 	assert.Equal(t, "accepted", body["status"])
-	assert.Equal(t, "018f0f38-5a52-7a01-8000-000000000030", body["reservation_id"])
+	assert.NotContains(t, body, "reservation_id")
+	assert.NotContains(t, body, "idempotency_key")
 	assert.Equal(t, float64(3000), body["total"].(map[string]any)["amount_in_cents"])
 
 	items := body["items"].([]any)
@@ -329,7 +330,7 @@ func testOrder(t *testing.T, accepted bool) *domain.Order {
 	require.NoError(t, err)
 
 	if accepted {
-		require.NoError(t, order.Accept("018f0f38-5a52-7a01-8000-000000000030", now))
+		require.NoError(t, order.Accept(now))
 	}
 
 	return order

@@ -9,10 +9,11 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc"
 
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/inbound/httpgin"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/catalogstub"
-	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/inventorystub"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/inventorygrpc"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/notificationlog"
 	orderpostgres "github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/postgres"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
@@ -23,6 +24,11 @@ type Dependencies struct {
 	Logger zerolog.Logger
 	Clock  func() time.Time
 	NewID  func() string
+
+	// InventoryConn is owned by the caller, which is also responsible for
+	// closing it.
+	InventoryConn    *grpc.ClientConn
+	InventoryTimeout time.Duration
 }
 
 // Module is what the order context contributes to the process.
@@ -36,7 +42,10 @@ func New(dependencies Dependencies) (*Module, error) {
 		return dependencies.Clock().Truncate(time.Microsecond)
 	})
 	newID := application.IDGenerator(dependencies.NewID)
-	inventory := inventorystub.NewReserver(newID, dependencies.Logger)
+	inventory := inventorygrpc.NewReserver(
+		dependencies.InventoryConn,
+		dependencies.InventoryTimeout,
+	)
 
 	createOrder := application.NewCreateOrder(
 		orderpostgres.NewOrderRepository(dependencies.DB),

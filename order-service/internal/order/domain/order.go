@@ -2,6 +2,7 @@ package domain
 
 import (
 	"fmt"
+	"math"
 	"net/mail"
 	"slices"
 	"strings"
@@ -10,14 +11,12 @@ import (
 
 type OrderID string
 type CustomerID string
-type ReservationID string
 
 type Order struct {
 	id             OrderID
 	customerID     CustomerID
 	customerEmail  string
 	status         Status
-	reservationID  ReservationID
 	idempotencyKey string
 	orderItems     []OrderItem
 	total          Money
@@ -62,7 +61,6 @@ func Reconstitute(
 	customerID CustomerID,
 	email string,
 	status Status,
-	reservationID ReservationID,
 	idempotencyKey string,
 	orderItems []OrderItem,
 	total Money,
@@ -74,7 +72,6 @@ func Reconstitute(
 		customerID:     customerID,
 		customerEmail:  email,
 		status:         status,
-		reservationID:  reservationID,
 		idempotencyKey: idempotencyKey,
 		orderItems:     slices.Clone(orderItems),
 		total:          total,
@@ -89,19 +86,14 @@ func Reconstitute(
 	return order, nil
 }
 
-// Accept receives the `now` from the caller so domain tests are deterministic.
-func (order *Order) Accept(reservationID ReservationID, now time.Time) error {
-	if strings.TrimSpace(string(reservationID)) == "" {
-		return ErrReservationRequired
-	}
-
-	if err := order.transitionTo(StatusAccepted, now); err != nil {
-		return err
-	}
-
-	order.reservationID = ReservationID(strings.TrimSpace(string(reservationID)))
-
-	return nil
+// Accept marks the order as backed by reserved stock. It receives the `now` from
+// the caller so domain tests are deterministic.
+//
+// There is no reservation identifier to record. Inventory holds stock against
+// this order's own id, so `accepted` is itself the statement that the stock was
+// secured — a second identifier would only repeat the order id back.
+func (order *Order) Accept(now time.Time) error {
+	return order.transitionTo(StatusAccepted, now)
 }
 
 func (order *Order) Reject(now time.Time) error {
@@ -122,10 +114,6 @@ func (order *Order) CustomerEmail() string {
 
 func (order *Order) Status() Status {
 	return order.status
-}
-
-func (order *Order) ReservationID() ReservationID {
-	return order.reservationID
 }
 
 func (order *Order) IdempotencyKey() string {
@@ -189,11 +177,6 @@ func (order *Order) validate() error {
 		return fmt.Errorf("%w: unknown status %q", ErrInvalidOrder, order.status)
 	}
 
-	if (order.status == StatusAccepted || order.status == StatusShipped) &&
-		strings.TrimSpace(string(order.reservationID)) == "" {
-		return fmt.Errorf("%w: %s order", ErrReservationRequired, order.status)
-	}
-
 	if order.createdAt.IsZero() || order.updatedAt.IsZero() || order.updatedAt.Before(order.createdAt) {
 		return fmt.Errorf("%w: timestamps are invalid", ErrInvalidOrder)
 	}
@@ -228,7 +211,15 @@ func calculateTotal(orderItems []OrderItem) (Money, error) {
 		}
 
 		quantity := int64(orderItem.quantity)
+		if orderItem.unitPrice.AmountInCents > math.MaxInt64/quantity {
+			return Money{}, fmt.Errorf("%w: item total overflows int64", ErrInvalidMoney)
+		}
+
 		lineAmountInCents := orderItem.unitPrice.AmountInCents * quantity
+		if amountInCents > math.MaxInt64-lineAmountInCents {
+			return Money{}, fmt.Errorf("%w: order total overflows int64", ErrInvalidMoney)
+		}
+
 		amountInCents += lineAmountInCents
 	}
 
