@@ -214,6 +214,47 @@ func TestCreateOrderDoesNotRetryInsufficientStockAndPersistsRejected(t *testing.
 	assert.Equal(t, 0, dependencies.notifier.calls)
 }
 
+// The order is stored as rejected either way, but what inventory said about the
+// refusal is the only thing a customer can act on, so it must survive being
+// persisted rather than being flattened into the sentinel.
+func TestCreateOrderKeepsTheShortfallBehindARejection(t *testing.T) {
+	dependencies := newDependencies()
+	dependencies.reserver.results = []error{&application.InsufficientStockError{
+		Shortfalls: []application.Shortfall{{ProductSKU: "SKU-A", Requested: 5, Available: 2}},
+	}}
+
+	_, err := dependencies.useCase().Execute(context.Background(), testCommand())
+
+	require.ErrorIs(t, err, application.ErrInsufficientStock)
+
+	var insufficient *application.InsufficientStockError
+	require.ErrorAs(t, err, &insufficient)
+	assert.Equal(t, []application.Shortfall{
+		{ProductSKU: "SKU-A", Requested: 5, Available: 2},
+	}, insufficient.Shortfalls)
+	assert.Equal(t, domain.StatusRejected, dependencies.repository.statusAtUpdate)
+}
+
+// A repeat of an order already refused is answered from this service's own
+// database, which holds the verdict but not the shortfall behind it. Replaying
+// one would state stock levels from an earlier moment as current fact.
+func TestCreateOrderRepeatingARejectedOrderReportsNoShortfall(t *testing.T) {
+	dependencies := newDependencies()
+	existing := pendingOrder(t, domain.OrderID(generatedID), testIdempotencyKey, "SKU-A")
+	require.NoError(t, existing.Reject(fixedNow))
+	dependencies.repository.findByKey = func(context.Context, string) (*domain.Order, error) {
+		return existing, nil
+	}
+
+	_, err := dependencies.useCase().Execute(context.Background(), testCommand())
+
+	require.ErrorIs(t, err, application.ErrInsufficientStock)
+
+	var insufficient *application.InsufficientStockError
+	assert.False(t, errors.As(err, &insufficient), "the verdict without a stale shortfall")
+	assert.Equal(t, 0, dependencies.reserver.calls, "inventory is not asked again")
+}
+
 func TestCreateOrderContextCancellationStopsInventoryRetryWait(t *testing.T) {
 	dependencies := newDependencies()
 	dependencies.reserver.results = []error{application.ErrInventoryUnavailable}

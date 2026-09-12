@@ -106,6 +106,69 @@ func TestReserveMapsStatusCodesOntoApplicationErrors(t *testing.T) {
 	}
 }
 
+// The shortfall is what a customer can act on, so it has to survive the trip
+// across the wire and back into this service's own vocabulary.
+func TestReserveCarriesTheShortfallBackFromInventory(t *testing.T) {
+	detailed, err := status.New(codes.FailedPrecondition, "insufficient stock").WithDetails(
+		&inventoryv1.InsufficientStockDetail{
+			Shortfalls: []*inventoryv1.InsufficientStockDetail_Shortfall{
+				{ProductSku: "SKU-A", Requested: 5, Available: 2},
+				{ProductSku: "SKU-B", Requested: 3, Available: 0},
+			},
+		},
+	)
+	require.NoError(t, err)
+
+	reserver := newReserver(t, &fakeInventory{err: detailed.Err()}, time.Second)
+
+	err = reserver.Reserve(context.Background(), testRequest())
+
+	require.ErrorIs(t, err, application.ErrInsufficientStock, "the retry contract is unchanged")
+
+	var insufficient *application.InsufficientStockError
+	require.ErrorAs(t, err, &insufficient)
+	assert.Equal(t, []application.Shortfall{
+		{ProductSKU: "SKU-A", Requested: 5, Available: 2},
+		{ProductSKU: "SKU-B", Requested: 3, Available: 0},
+	}, insufficient.Shortfalls)
+}
+
+// Details refine the answer; they never decide it. An inventory that sends none
+// — an older build, or a failure it has nothing to add about — must behave
+// exactly as it did before details existed.
+func TestReserveWorksAgainstAnInventoryThatSendsNoDetails(t *testing.T) {
+	reserver := newReserver(
+		t,
+		&fakeInventory{err: status.Error(codes.FailedPrecondition, "insufficient stock")},
+		time.Second,
+	)
+
+	err := reserver.Reserve(context.Background(), testRequest())
+
+	require.ErrorIs(t, err, application.ErrInsufficientStock)
+
+	var insufficient *application.InsufficientStockError
+	assert.False(t, errors.As(err, &insufficient), "nothing to report is not an empty report")
+}
+
+// A rejection is this service's bug, not the customer's, so it stays a 500. What
+// inventory said about it still has to reach the log an operator will read:
+// unknown skus here mean the catalogue and the warehouse disagree.
+func TestReserveKeepsWhatInventorySaidAboutARejection(t *testing.T) {
+	detailed, err := status.New(codes.NotFound, "unknown product sku").WithDetails(
+		&inventoryv1.UnknownProductsDetail{ProductSkus: []string{"SKU-GHOST", "SKU-PHANTOM"}},
+	)
+	require.NoError(t, err)
+
+	reserver := newReserver(t, &fakeInventory{err: detailed.Err()}, time.Second)
+
+	err = reserver.Reserve(context.Background(), testRequest())
+
+	require.ErrorIs(t, err, inventorygrpc.ErrInventoryRejectedRequest)
+	assert.Contains(t, err.Error(), "SKU-GHOST")
+	assert.Contains(t, err.Error(), "SKU-PHANTOM")
+}
+
 // A hung inventory has to surface as the retryable case, not hang the order
 // request until the HTTP write timeout fires.
 func TestReserveTurnsAStalledCallIntoARetryableError(t *testing.T) {
