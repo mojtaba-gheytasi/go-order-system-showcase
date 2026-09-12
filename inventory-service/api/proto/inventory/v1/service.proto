@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package inventory.v1;
+
+option go_package = "github.com/mojtaba-gheytasi/go-order-system-showcase/inventory-service/api/gen/inventory/v1;inventoryv1";
+
+// InventoryService is the public contract of inventory-service.
+//
+// Failures are reported as gRPC status codes rather than as fields on the
+// response, because the code is what a caller's retry policy keys on. This
+// table is the whole failure contract — every code this service raises, the
+// google.rpc.ErrorInfo reason it carries, and the detail that comes with it:
+//
+//   CODE                 REASON (domain "inventory.v1")  DETAIL                     RETRY
+//   -----------------------------------------------------------------------------------
+//   INVALID_ARGUMENT     INVALID_REQUEST                 google.rpc.BadRequest      no
+//   FAILED_PRECONDITION  INSUFFICIENT_STOCK              InsufficientStockDetail    no
+//   NOT_FOUND            UNKNOWN_PRODUCT_SKU             UnknownProductsDetail      no
+//   ALREADY_EXISTS       IDEMPOTENCY_CONFLICT            IdempotencyConflictDetail  no
+//   INTERNAL             INTERNAL                        none, deliberately         no
+//
+// Three further codes can arrive with no ErrorInfo at all, because a dying
+// context or the transport raises them before this service has an answer:
+//
+//   CANCELED             the caller went away                                       no
+//   DEADLINE_EXCEEDED    this server was too slow                                   yes
+//   UNAVAILABLE          this server could not be reached                           yes
+//
+// The reason is the stable machine-readable name of what went wrong; the code
+// stays coarse because that is what generic middleware can act on.
+//
+// Details are optional and additive. A caller that reads only the code is
+// unaffected by them, one that meets a detail type it does not know skips it,
+// and a failure may carry none — the detail refines the answer, it never
+// decides it. INTERNAL carries none on purpose: a caller learns that this
+// server is broken, not how. Send an x-request-id in the call metadata and it
+// comes back in the ErrorInfo metadata and appears in this server's logs, which
+// is how an INTERNAL is diagnosed after the fact.
+service InventoryService {
+  // ReserveStock holds stock for an order.
+  //
+  // order_id is the idempotency key. Repeating a request for the same order_id
+  // succeeds without holding the stock a second time.
+  //
+  // A request that failed holds nothing and is not recorded, so retrying it is a
+  // fresh attempt and will succeed if the warehouse has been restocked.
+  rpc ReserveStock(ReserveStockRequest) returns (ReserveStockResponse);
+}
+
+// ReservationLine is a quantity of one product. Lines carry no price: what an
+// order costs is the order service's business.
+message ReservationLine {
+  string product_sku = 1;
+  int32 quantity = 2;
+}
+
+message ReserveStockRequest {
+  // The caller's order identifier, used as the idempotency key.
+  string order_id = 1;
+  repeated ReservationLine lines = 2;
+}
+
+// Deliberately empty. One order holds stock at most once, so the order id the
+// caller already has identifies the hold; returning a second identifier would
+// only be a synonym for it. Success is the OK status.
+message ReserveStockResponse {}
+
+// InsufficientStockDetail reports every line that could not be filled, not just
+// the first, so a caller can correct a whole cart in one round trip instead of
+// discovering one bad line per attempt.
+message InsufficientStockDetail {
+  message Shortfall {
+    string product_sku = 1;
+    // What the request asked for.
+    int32 requested = 2;
+    // What was free when the claim was refused.
+    //
+    // Advisory, not a promise: another order may take it a moment later, and a
+    // restock may make more of it. It is a hint for the caller's next request.
+    int32 available = 3;
+  }
+
+  // Ordered by product_sku, so two reports of the same problem compare equal.
+  repeated Shortfall shortfalls = 1;
+}
+
+// UnknownProductsDetail names every sku this service does not stock. A
+// populated list means the caller's catalogue and this warehouse disagree about
+// which products exist, which is an operational problem rather than a bad
+// request.
+message UnknownProductsDetail {
+  // Sorted, for the same reason the shortfalls are.
+  repeated string product_skus = 1;
+}
+
+// IdempotencyConflictDetail reports both sides of the conflict, because the
+// difference between them is the diagnosis: it tells a caller whether it
+// resubmitted an order under a changed basket or generated a colliding order
+// id, and those have different fixes.
+message IdempotencyConflictDetail {
+  // What this order id already holds.
+  repeated ReservationLine held = 1;
+  // What the rejected request asked for.
+  repeated ReservationLine requested = 2;
+}
