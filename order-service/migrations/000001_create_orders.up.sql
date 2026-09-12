@@ -5,7 +5,6 @@ CREATE TABLE orders (
     customer_id     UUID        NOT NULL,
     customer_email  TEXT        NOT NULL,
     status          TEXT        NOT NULL,
-    reservation_id  UUID,
     idempotency_key TEXT        NOT NULL,
     total_amount_in_cents BIGINT      NOT NULL,
     currency        TEXT        NOT NULL,

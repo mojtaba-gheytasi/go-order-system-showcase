@@ -15,13 +15,13 @@ import (
 )
 
 const (
-	codeInvalidRequest         = "invalid_request"
-	codeValidationFailed       = "validation_failed"
-	codeProductNotFound        = "product_not_found"
-	codeCatalogUnavailable     = "catalog_unavailable"
-	codeInsufficientStock      = "insufficient_stock"
-	codeInventoryUnavailable   = "inventory_unavailable"
-	codeInternal               = "internal_error"
+	codeInvalidRequest       = "invalid_request"
+	codeValidationFailed     = "validation_failed"
+	codeProductNotFound      = "product_not_found"
+	codeCatalogUnavailable   = "catalog_unavailable"
+	codeInsufficientStock    = "insufficient_stock"
+	codeInventoryUnavailable = "inventory_unavailable"
+	codeInternal             = "internal_error"
 )
 
 type errorBody struct {
@@ -88,7 +88,6 @@ func respondUseCaseError(context *gin.Context, err error) {
 	case errors.Is(err, domain.ErrInvalidOrder),
 		errors.Is(err, domain.ErrInvalidOrderItem),
 		errors.Is(err, domain.ErrInvalidMoney),
-		errors.Is(err, domain.ErrReservationRequired),
 		errors.Is(err, domain.ErrInvalidStatusTransition):
 		respondError(
 			context,

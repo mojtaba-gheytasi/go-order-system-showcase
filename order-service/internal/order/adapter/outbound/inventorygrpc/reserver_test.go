@@ -1,0 +1,174 @@
+package inventorygrpc_test
+
+import (
+	"context"
+	"errors"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
+
+	inventoryv1 "github.com/mojtaba-gheytasi/go-order-system-showcase/inventory-service/api/gen/inventory/v1"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/inventorygrpc"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/domain"
+)
+
+func testRequest() application.ReservationRequest {
+	return application.ReservationRequest{
+		OrderID: domain.OrderID("018f0f38-5a52-7a01-8000-000000000010"),
+		Lines:   []application.ReservationLine{{ProductSKU: "SKU-A", Quantity: 2}},
+	}
+}
+
+func TestReserveSucceedsWhenInventoryAccepts(t *testing.T) {
+	reserver := newReserver(t, &fakeInventory{}, time.Second)
+
+	require.NoError(t, reserver.Reserve(context.Background(), testRequest()))
+}
+
+// This table is the retry contract. CreateOrder retries only
+// ErrInventoryUnavailable, so what this mapping calls retryable is what actually
+// gets retried three times.
+func TestReserveMapsStatusCodesOntoApplicationErrors(t *testing.T) {
+	tests := map[string]struct {
+		code      codes.Code
+		want      error
+		retryable bool
+	}{
+		"out of stock": {
+			code:      codes.FailedPrecondition,
+			want:      application.ErrInsufficientStock,
+			retryable: false,
+		},
+		"unknown product": {
+			code:      codes.NotFound,
+			want:      inventorygrpc.ErrInventoryRejectedRequest,
+			retryable: false,
+		},
+		"malformed request": {
+			code:      codes.InvalidArgument,
+			want:      inventorygrpc.ErrInventoryRejectedRequest,
+			retryable: false,
+		},
+		"idempotency conflict": {
+			code:      codes.AlreadyExists,
+			want:      inventorygrpc.ErrInventoryRejectedRequest,
+			retryable: false,
+		},
+		"inventory unreachable": {
+			code:      codes.Unavailable,
+			want:      application.ErrInventoryUnavailable,
+			retryable: true,
+		},
+		// A bug on the server. Retrying reproduces it and adds load to a
+		// service already in trouble, so this must NOT be retryable.
+		"server fault": {
+			code:      codes.Internal,
+			want:      nil,
+			retryable: false,
+		},
+	}
+
+	for name, testCase := range tests {
+		t.Run(name, func(t *testing.T) {
+			reserver := newReserver(
+				t,
+				&fakeInventory{err: status.Error(testCase.code, "from the test")},
+				time.Second,
+			)
+
+			err := reserver.Reserve(context.Background(), testRequest())
+			require.Error(t, err)
+
+			if testCase.want != nil {
+				require.ErrorIs(t, err, testCase.want)
+			}
+
+			assert.Equal(
+				t,
+				testCase.retryable,
+				errors.Is(err, application.ErrInventoryUnavailable),
+				"whether CreateOrder will retry this",
+			)
+		})
+	}
+}
+
+// A hung inventory has to surface as the retryable case, not hang the order
+// request until the HTTP write timeout fires.
+func TestReserveTurnsAStalledCallIntoARetryableError(t *testing.T) {
+	reserver := newReserver(t, &fakeInventory{delay: time.Second}, 50*time.Millisecond)
+
+	err := reserver.Reserve(context.Background(), testRequest())
+
+	require.ErrorIs(t, err, application.ErrInventoryUnavailable)
+}
+
+// --- helpers -------------------------------------------------------------
+
+func newReserver(
+	t *testing.T,
+	inventory inventoryv1.InventoryServiceServer,
+	timeout time.Duration,
+) *inventorygrpc.Reserver {
+	t.Helper()
+
+	listener := bufconn.Listen(1024 * 1024)
+	server := grpc.NewServer()
+	inventoryv1.RegisterInventoryServiceServer(server, inventory)
+
+	go func() {
+		_ = server.Serve(listener)
+	}()
+
+	connection, err := grpc.NewClient(
+		"passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return listener.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = connection.Close()
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	return inventorygrpc.NewReserver(connection, timeout)
+}
+
+type fakeInventory struct {
+	inventoryv1.UnimplementedInventoryServiceServer
+
+	err   error
+	delay time.Duration
+}
+
+func (inventory *fakeInventory) ReserveStock(
+	ctx context.Context,
+	_ *inventoryv1.ReserveStockRequest,
+) (*inventoryv1.ReserveStockResponse, error) {
+	if inventory.delay > 0 {
+		select {
+		case <-time.After(inventory.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	if inventory.err != nil {
+		return nil, inventory.err
+	}
+
+	return &inventoryv1.ReserveStockResponse{}, nil
+}

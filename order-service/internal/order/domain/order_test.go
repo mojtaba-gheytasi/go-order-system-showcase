@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -30,13 +31,7 @@ func TestNewOrderCalculatesTotalAndAcceptRequiresAReservation(t *testing.T) {
 	assert.Equal(t, domain.StatusPending, order.Status())
 	assert.Equal(t, domain.Money{AmountInCents: 3000, Currency: "EUR"}, order.Total())
 
-	err = order.Accept("", now.Add(time.Minute))
-	require.ErrorIs(t, err, domain.ErrReservationRequired)
-
-	err = order.Accept(
-		"018f0f38-5a52-7a01-8000-000000000030",
-		now.Add(time.Minute),
-	)
+	err = order.Accept(now.Add(time.Minute))
 	require.NoError(t, err)
 	assert.Equal(t, domain.StatusAccepted, order.Status())
 }
@@ -54,18 +49,12 @@ func TestAcceptedAndRejectedOrdersCannotBeProcessedAgain(t *testing.T) {
 	now := time.Date(2026, time.August, 30, 12, 0, 0, 0, time.UTC)
 
 	accepted := newOrder(t, now)
-	require.NoError(t, accepted.Accept(
-		"018f0f38-5a52-7a01-8000-000000000030",
-		now.Add(time.Minute),
-	))
+	require.NoError(t, accepted.Accept(now.Add(time.Minute)))
 	require.ErrorIs(t, accepted.Reject(now.Add(2*time.Minute)), domain.ErrInvalidStatusTransition)
 
 	rejected := newOrder(t, now)
 	require.NoError(t, rejected.Reject(now.Add(time.Minute)))
-	require.ErrorIs(t, rejected.Accept(
-		"018f0f38-5a52-7a01-8000-000000000030",
-		now.Add(2*time.Minute),
-	), domain.ErrInvalidStatusTransition)
+	require.ErrorIs(t, rejected.Accept(now.Add(2*time.Minute)), domain.ErrInvalidStatusTransition)
 }
 
 // Order item position becomes the persisted line number, so the aggregate must
@@ -116,6 +105,35 @@ func TestNewOrderItemRejectsUnsupportedCurrency(t *testing.T) {
 	)
 
 	require.ErrorIs(t, err, domain.ErrInvalidMoney)
+}
+
+func TestNewOrderRejectsMoneyOverflow(t *testing.T) {
+	now := time.Date(2026, time.August, 30, 12, 0, 0, 0, time.UTC)
+	tests := map[string][]domain.OrderItem{
+		"line total": {
+			newOrderItem(t, "SKU-A", 2, math.MaxInt64),
+		},
+		"order total": {
+			newOrderItem(t, "SKU-A", 1, math.MaxInt64),
+			newOrderItem(t, "SKU-B", 1, 1),
+		},
+	}
+
+	for name, orderItems := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := domain.NewOrder(
+				"018f0f38-5a52-7a01-8000-000000000010",
+				"018f0f38-5a52-7a01-8000-000000000020",
+				"customer@example.com",
+				"create-order-1",
+				orderItems,
+				now,
+			)
+
+			require.ErrorIs(t, err, domain.ErrInvalidMoney)
+			assert.Contains(t, err.Error(), "overflows int64")
+		})
+	}
 }
 
 func newOrderItem(t *testing.T, sku string, quantity int, amountInCents int64) domain.OrderItem {

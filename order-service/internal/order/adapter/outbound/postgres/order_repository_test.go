@@ -45,10 +45,7 @@ func TestOrderRepositoryConditionallyUpdatesAcceptedAndRejectedOrders(t *testing
 
 	accepted := newTestOrder(t, "018f0f38-5a52-7a01-8000-000000000010", "accept-order")
 	require.NoError(t, repository.Create(ctx, accepted))
-	require.NoError(t, accepted.Accept(
-		"018f0f38-5a52-7a01-8000-000000000030",
-		accepted.CreatedAt().Add(time.Minute),
-	))
+	require.NoError(t, accepted.Accept(accepted.CreatedAt().Add(time.Minute)))
 	require.NoError(t, repository.Update(ctx, accepted, domain.StatusPending))
 
 	foundAccepted, err := repository.FindByID(ctx, accepted.ID())
@@ -165,7 +162,6 @@ func assertOrdersEqual(t *testing.T, expected, actual *domain.Order) {
 	assert.Equal(t, expected.CustomerID(), actual.CustomerID())
 	assert.Equal(t, expected.CustomerEmail(), actual.CustomerEmail())
 	assert.Equal(t, expected.Status(), actual.Status())
-	assert.Equal(t, expected.ReservationID(), actual.ReservationID())
 	assert.Equal(t, expected.IdempotencyKey(), actual.IdempotencyKey())
 	assert.Equal(t, expected.Total(), actual.Total())
 	assert.True(t, expected.CreatedAt().Equal(actual.CreatedAt()))

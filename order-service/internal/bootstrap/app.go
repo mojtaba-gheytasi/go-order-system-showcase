@@ -7,11 +7,14 @@ package bootstrap
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/wiring"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/config"
@@ -20,10 +23,11 @@ import (
 )
 
 type App struct {
-	logger  zerolog.Logger
-	address string
-	db      *sql.DB
-	server  *httpserver.Server
+	logger        zerolog.Logger
+	address       string
+	db            *sql.DB
+	inventoryConn *grpc.ClientConn
+	server        *httpserver.Server
 }
 
 func New(
@@ -43,22 +47,42 @@ func New(
 
 	logger.Info().Msg("connected to PostgreSQL")
 
+	// grpc.NewClient does not connect here: it resolves the target and returns
+	// a lazily-connecting client. That is deliberate — inventory being down must
+	// not stop this service from booting and serving the endpoints that do not
+	// need it. A call made while inventory is unreachable fails with
+	// codes.Unavailable, which is exactly the retryable case.
+	inventoryConn, err := grpc.NewClient(
+		applicationConfig.InventoryGRPCAddress,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		_ = db.Close()
+
+		return nil, fmt.Errorf("create inventory client: %w", err)
+	}
+
 	orderModule, err := wiring.New(wiring.Dependencies{
-		DB:     db,
-		Logger: logger,
-		Clock:  func() time.Time { return time.Now().UTC() },
-		NewID:  newIDGenerator(logger),
+		DB:               db,
+		Logger:           logger,
+		Clock:            func() time.Time { return time.Now().UTC() },
+		NewID:            newIDGenerator(logger),
+		InventoryConn:    inventoryConn,
+		InventoryTimeout: applicationConfig.InventoryGRPCTimeout,
 	})
 	if err != nil {
+		// No App is returned, so nobody will close these.
+		_ = inventoryConn.Close()
 		_ = db.Close()
 
 		return nil, fmt.Errorf("wire the order context: %w", err)
 	}
 
 	return &App{
-		logger:  logger,
-		address: applicationConfig.HTTPServerAddress,
-		db:      db,
+		logger:        logger,
+		address:       applicationConfig.HTTPServerAddress,
+		db:            db,
+		inventoryConn: inventoryConn,
 		server: httpserver.NewServer(
 			httpserver.Config{
 				Address:           applicationConfig.HTTPServerAddress,
@@ -97,7 +121,11 @@ func (app *App) Shutdown(ctx context.Context) error {
 	return app.server.Shutdown(ctx)
 }
 
-// Close releases the resources New acquired. Call it after Shutdown.
-func (app *App) Close() error {
-	return app.db.Close()
+// CloseDB releases the resources New acquired. Call it after Shutdown, so that
+// requests still draining can finish the calls they are in the middle of.
+//
+// errors.Join rather than an early return: a failure closing the inventory
+// connection must not leave the database pool open.
+func (app *App) CloseDB() error {
+	return errors.Join(app.inventoryConn.Close(), app.db.Close())
 }

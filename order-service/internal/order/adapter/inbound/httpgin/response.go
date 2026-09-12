@@ -19,16 +19,14 @@ type orderItemResponse struct {
 }
 
 type orderResponse struct {
-	ID             string              `json:"id"`
-	CustomerID     string              `json:"customer_id"`
-	CustomerEmail  string              `json:"customer_email"`
-	Status         string              `json:"status"`
-	ReservationID  string              `json:"reservation_id,omitempty"`
-	IdempotencyKey string              `json:"idempotency_key"`
-	Items          []orderItemResponse `json:"items"`
-	Total          moneyResponse       `json:"total"`
-	CreatedAt      time.Time           `json:"created_at"`
-	UpdatedAt      time.Time           `json:"updated_at"`
+	ID            string              `json:"id"`
+	CustomerID    string              `json:"customer_id"`
+	CustomerEmail string              `json:"customer_email"`
+	Status        string              `json:"status"`
+	Items         []orderItemResponse `json:"items"`
+	Total         moneyResponse       `json:"total"`
+	CreatedAt     time.Time           `json:"created_at"`
+	UpdatedAt     time.Time           `json:"updated_at"`
 }
 
 func orderResponseFrom(order *domain.Order) orderResponse {
@@ -51,13 +49,11 @@ func orderResponseFrom(order *domain.Order) orderResponse {
 	total := order.Total()
 
 	return orderResponse{
-		ID:             string(order.ID()),
-		CustomerID:     string(order.CustomerID()),
-		CustomerEmail:  order.CustomerEmail(),
-		Status:         string(order.Status()),
-		ReservationID:  string(order.ReservationID()),
-		IdempotencyKey: order.IdempotencyKey(),
-		Items:          items,
+		ID:            string(order.ID()),
+		CustomerID:    string(order.CustomerID()),
+		CustomerEmail: order.CustomerEmail(),
+		Status:        string(order.Status()),
+		Items:         items,
 		Total: moneyResponse{
 			AmountInCents: total.AmountInCents,
 			Currency:      total.Currency,

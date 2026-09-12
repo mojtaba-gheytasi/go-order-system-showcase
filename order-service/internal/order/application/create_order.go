@@ -122,7 +122,7 @@ func (useCase *CreateOrder) processPending(
 	order *domain.Order,
 	created bool,
 ) (CreateOrderResult, error) {
-	reservationID, err := useCase.reserveInventory(ctx, reservationRequestFor(order))
+	err := useCase.reserveInventory(ctx, reservationRequestFor(order))
 	if err != nil {
 		if errors.Is(err, ErrInsufficientStock) {
 			return useCase.reject(ctx, order, created)
@@ -131,7 +131,7 @@ func (useCase *CreateOrder) processPending(
 		return CreateOrderResult{}, fmt.Errorf("reserve inventory: %w", err)
 	}
 
-	if err := order.Accept(reservationID, useCase.clock()); err != nil {
+	if err := order.Accept(useCase.clock()); err != nil {
 		return CreateOrderResult{}, fmt.Errorf("accept order: %w", err)
 	}
 
@@ -196,31 +196,31 @@ func (useCase *CreateOrder) resultAfterConflict(
 func (useCase *CreateOrder) reserveInventory(
 	ctx context.Context,
 	request ReservationRequest,
-) (domain.ReservationID, error) {
+) error {
 	var lastErr error
 
 	for attempt := 0; attempt < inventoryReservationAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return err
 		}
 
-		reservationID, err := useCase.inventory.Reserve(ctx, request)
+		err := useCase.inventory.Reserve(ctx, request)
 		if err == nil {
-			return reservationID, nil
+			return nil
 		}
 
 		lastErr = err
 		if errors.Is(err, ErrInventoryUnavailable) == false || attempt == inventoryReservationAttempts-1 {
-			return "", err
+			return err
 		}
 
 		delay := inventoryRetryInitialDelay * time.Duration(attempt+1)
 		if err := waitForRetry(ctx, delay); err != nil {
-			return "", err
+			return err
 		}
 	}
 
-	return "", lastErr
+	return lastErr
 }
 
 func waitForRetry(ctx context.Context, delay time.Duration) error {
