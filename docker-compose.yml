@@ -1,0 +1,134 @@
+services:
+  order:
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+      target: development
+    working_dir: /workspace/order-service
+    init: true
+    env_file:
+      - ${ORDER_ENV_FILE:-./order-service/.env.example}
+    environment:
+      GIN_MODE: debug
+      DATABASE_URL: postgres://${ORDER_DB_USER:-orders}:${ORDER_DB_PASSWORD:-orders_dev_password}@order-postgres:5432/${ORDER_DB_NAME:-orders}?sslmode=disable
+      INVENTORY_GRPC_ADDRESS: inventory:50051
+    depends_on:
+      order-postgres:
+        condition: service_healthy
+      order-migrate:
+        condition: service_completed_successfully
+      inventory:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/workspace
+
+  order-migrate:
+    image: migrate/migrate:v4.19.1
+    command:
+      - -path=/migrations/
+      - -database=postgres://${ORDER_DB_USER:-orders}:${ORDER_DB_PASSWORD:-orders_dev_password}@order-postgres:5432/${ORDER_DB_NAME:-orders}?sslmode=disable
+      - up
+    depends_on:
+      order-postgres:
+        condition: service_healthy
+    restart: "no"
+    volumes:
+      - ./order-service/migrations:/migrations:ro
+
+  order-postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: ${ORDER_DB_NAME:-orders}
+      POSTGRES_USER: ${ORDER_DB_USER:-orders}
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD:-orders_dev_password}
+    ports:
+      - "${ORDER_DB_PORT:-5433}:5432"
+    volumes:
+      - order-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  inventory:
+    build:
+      context: .
+      dockerfile: inventory-service/Dockerfile
+      target: development
+    working_dir: /workspace/inventory-service
+    init: true
+    env_file:
+      - ${INVENTORY_ENV_FILE:-./inventory-service/.env.example}
+    environment:
+      DATABASE_URL: postgres://${INVENTORY_DB_USER:-inventory}:${INVENTORY_DB_PASSWORD:-inventory_dev_password}@inventory-postgres:5432/${INVENTORY_DB_NAME:-inventory}?sslmode=disable
+    depends_on:
+      inventory-postgres:
+        condition: service_healthy
+      inventory-migrate:
+        condition: service_completed_successfully
+      inventory-seed:
+        condition: service_completed_successfully
+    ports:
+      - "${INVENTORY_GRPC_PORT:-50051}:50051"
+    volumes:
+      - .:/workspace
+
+  inventory-migrate:
+    image: migrate/migrate:v4.19.1
+    command:
+      - -path=/migrations/
+      - -database=postgres://${INVENTORY_DB_USER:-inventory}:${INVENTORY_DB_PASSWORD:-inventory_dev_password}@inventory-postgres:5432/${INVENTORY_DB_NAME:-inventory}?sslmode=disable
+      - up
+    depends_on:
+      inventory-postgres:
+        condition: service_healthy
+    restart: "no"
+    volumes:
+      - ./inventory-service/migrations:/migrations:ro
+
+  # Development stock, applied after the schema exists. It is a separate
+  # container rather than a migration because seed data and schema have
+  # different lifetimes: a migration would also run in production, where this
+  # data is fiction.
+  inventory-seed:
+    image: postgres:18.6-alpine
+    environment:
+      PGPASSWORD: ${INVENTORY_DB_PASSWORD:-inventory_dev_password}
+    command:
+      - psql
+      - --host=inventory-postgres
+      - --username=${INVENTORY_DB_USER:-inventory}
+      - --dbname=${INVENTORY_DB_NAME:-inventory}
+      - --set=ON_ERROR_STOP=1
+      - --file=/seed/dev-seed.sql
+    depends_on:
+      inventory-migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    volumes:
+      - ./deploy/inventory:/seed:ro
+
+  inventory-postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: ${INVENTORY_DB_NAME:-inventory}
+      POSTGRES_USER: ${INVENTORY_DB_USER:-inventory}
+      POSTGRES_PASSWORD: ${INVENTORY_DB_PASSWORD:-inventory_dev_password}
+    ports:
+      - "${INVENTORY_DB_PORT:-5434}:5432"
+    volumes:
+      - inventory-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  order-postgres-data:
+  inventory-postgres-data:
