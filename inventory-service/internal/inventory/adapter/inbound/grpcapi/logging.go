@@ -8,6 +8,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/inventory-service/internal/platform/correlation"
 )
 
 // Logging returns a unary interceptor that writes one structured line per call.
@@ -43,11 +45,16 @@ func Logging(logger zerolog.Logger, skipMethods ...string) grpc.UnaryServerInter
 			event = logger.Error()
 		}
 
-		event.
+		event = event.
 			Str("grpc_method", info.FullMethod).
 			Str("grpc_code", code.String()).
-			Dur("duration_ms", time.Since(startedAt)).
-			Msg("grpc call")
+			Dur("duration_ms", time.Since(startedAt))
+
+		if requestID := correlation.FromContext(ctx); requestID != "" {
+			event = event.Str("request_id", requestID)
+		}
+
+		event.Msg("grpc call")
 
 		return response, err
 	}
