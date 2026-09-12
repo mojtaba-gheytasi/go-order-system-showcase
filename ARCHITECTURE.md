@@ -9,6 +9,7 @@ Decisions are recorded here as they are made, so everything is in one place.
 - [How services share contracts](#how-services-share-contracts)
 - [Inside a service: staying testable](#inside-a-service-staying-testable)
 - [What happens when things fail halfway](#what-happens-when-things-fail-halfway)
+- [How inventory survives contention](#how-inventory-survives-contention)
 - [What CI enforces](#what-ci-enforces)
 - [Trade-offs accepted](#trade-offs-accepted)
 
@@ -16,13 +17,13 @@ Decisions are recorded here as they are made, so everything is in one place.
 
 ## The system
 
-Part of an order processing system, built as three services:
+The intended showcase is an order processing system with three service boundaries:
 
 ```mermaid
 graph LR
     C[Client] -->|REST| O[order-service]
     O -->|gRPC| I[inventory-service]
-    I -->|RabbitMQ| N[notification-service]
+    O -->|RabbitMQ| N[notification-service]
 ```
 
 | Service | Responsibility | Exposes |
@@ -36,6 +37,11 @@ answer from inventory, so that call is synchronous. Sending a notification does 
 need to block the order, and should not fail the order if the notifier is down, so
 that hop is asynchronous.
 
+The current implemented slice is deliberately smaller: `order-service` exposes
+`POST /orders` and calls a real `inventory-service` over gRPC. The product catalog and
+the notifier are still temporary in-process adapters, and RabbitMQ, the transactional
+outbox, and notification-service remain future work.
+
 ---
 
 ## Why these three services
@@ -45,7 +51,7 @@ different ways, live apart.**
 
 | Service | The rule it protects | Why it is on its own |
 | --- | --- | --- |
-| **order** | An order cannot be confirmed without reserved stock, and cannot be cancelled once shipped | Owns the order lifecycle. Changes when order rules change. |
+| **order** | An order cannot be accepted without reserved stock, and cannot be cancelled once shipped | Owns the order lifecycle. Changes when order rules change. |
 | **inventory** | Available stock never drops below zero | Its hard problem is contention — many orders competing for the same rows at once. A completely different concurrency profile from order. |
 | **notification** | none | It has no business rule at all. It is separate because it *fails* differently: email providers are slow and unreliable, and that must never stop someone placing an order. |
 
@@ -84,9 +90,9 @@ and ten places to change when something shared moves. Real cost, no benefit.
 
 ## How services share contracts
 
-order calls inventory over gRPC, and order sends events to notification over
-RabbitMQ. Both need a shared definition of the messages. Where that definition lives
-is the decision.
+order-service calls inventory over gRPC, and will send events to notification over
+RabbitMQ. Both need a shared definition of the messages. The gRPC half of this is
+implemented; the RabbitMQ half is still design direction.
 
 ### Options not taken
 
@@ -98,34 +104,44 @@ API it serves — the definition of the inventory API would sit outside inventor
 of the `.proto` file. This works on day one and needs no shared code at all. But there
 is no longer a single source of truth, so the copies drift — and nothing tells you.
 
-### What is used instead
+### Contract ownership
 
-Each service keeps its public API in a small, separate Go module inside its own
-folder:
+Each service keeps its public API in a small, separate Go module inside its own folder:
 
 ```
-order-service/
-  go.mod                    ← the service itself (database, queue, HTTP, ...)
+inventory-service/
+  go.mod                    ← the service itself (database, gRPC server, ...)
   api/
     go.mod                  ← the public API, and nothing else
     proto/inventory/v1/
-      service.proto         gRPC methods
-      events.proto          RabbitMQ message shapes
-      types.proto           types shared by both
-    gen/                    generated Go code (committed to git)
-    topology.go             exchange and routing key names
+      service.proto         gRPC methods and message shapes
+    gen/inventory/v1/       generated Go code (committed to git)
 ```
 
-`inventory-service/api` is a Go module of its own, and depends on exactly two
-libraries: gRPC and protobuf.
+`inventory-service/api` is a Go module of its own whose entire dependency list is two
+libraries: gRPC and protobuf. That is checkable rather than aspirational — open its
+`go.mod`.
 
-Order then writes:
+Order writes:
 
 ```go
 import inventoryv1 ".../inventory-service/api/gen/inventory/v1"
 ```
 
 and gets the client, the message types, and nothing else.
+
+**How the modules find each other.** A `replace` directive in `order-service/go.mod`
+points at `../inventory-service/api`. There is deliberately no `go.work`: a workspace
+would need every one of its `use` directories present at build time, but each service's
+Dockerfile copies only the directories it needs, so the workspace would have to be
+rewritten during the image build. A `replace` behaves identically on a laptop and inside
+Docker, and one mechanism is easier to reason about than two that can disagree.
+
+**buf owns the generation.** `buf.gen.yaml` pins remote plugin versions, so `make proto`
+produces byte-identical output on any machine without anyone installing
+`protoc-gen-go`. `make proto-lint` enforces the standard naming rules and
+`make proto-breaking` compares against `main`, which is the part that turns "we have a
+`.proto`" into an actual contract.
 
 ### What this gives us
 
@@ -155,28 +171,29 @@ service can consume several APIs without its dependency list growing.
 
 ## Inside a service: staying testable
 
-order-service talks to Postgres, to inventory over gRPC, and to RabbitMQ. If checking
-the rule *"an order cannot be confirmed without reserved stock"* requires all three to
-be running, the tests are slow and flaky, and people stop running them.
+order-service persists to Postgres and is designed to talk to inventory and
+notification through replaceable adapters. If checking the rule *"an order cannot be
+accepted without reserved stock"* requires infrastructure to be running, the tests
+are slow and flaky, and people stop running them.
 
-So the rules live in a package that does not know any of those exist. The domain
-declares what it needs, as an interface:
+The rules live in a package that does not know any of those exist. The application
+layer declares the external capability it needs as a port:
 
 ```go
-// internal/order/domain — imports nothing outside the standard library
-type StockReserver interface {
-    Reserve(ctx context.Context, sku string, qty int) (ReservationID, error)
+// internal/order/application
+type InventoryReserver interface {
+    Reserve(ctx context.Context, request ReservationRequest) (domain.ReservationID, error)
 }
 ```
 
-The gRPC client satisfies it. Go makes this cheap: interfaces are satisfied
+The temporary in-process adapter satisfies it today; a later gRPC client can satisfy
+the same port. Go makes this cheap: interfaces are satisfied
 implicitly, and are declared where they are *used* rather than where they are
 implemented. Dependencies end up pointing inward with no framework and no
 dependency-injection container.
 
 ```
 order-service/
-  api/                       the public contract (above)
   internal/
     order/
       domain/                rules — standard library only
@@ -184,8 +201,9 @@ order-service/
       adapter/
         inbound/httpgin/     REST handlers
         outbound/postgres/   order repository
-        outbound/grpc/       inventory client
-        outbound/rabbitmq/   outbox relay
+        outbound/catalogstub/       temporary price catalog
+        outbound/inventorystub/     temporary inventory adapter
+        outbound/notificationlog/   temporary notification adapter
       wiring/                builds the order context
     platform/                config, logger, database pool, HTTP server
     bootstrap/               builds the process
@@ -198,7 +216,8 @@ architecture describes. The name matters less than the property it buys:
 > `go test ./internal/order/domain/...` needs no Docker, no network, and no other
 > service running.
 
-That is a claim CI can check, and it does.
+That property is exercised by the current test suite and is suitable for a dedicated
+import-boundary CI check later.
 
 ### Where everything is wired
 
@@ -211,8 +230,9 @@ into an exit code.
 The split is what keeps it from growing into a mess. `internal/platform/httpserver`
 receives an already-built `http.Handler` and never learns what a use case is, so the
 inventory service reuses it verbatim. And because `wiring` returns a struct rather than a
-bare handler, the outbox relay can be added to it later without either package changing
-shape — the order context will run more than one transport.
+bare handler, another process such as a future outbox relay can be added later without
+either package changing shape — the order context can eventually run more than one
+transport.
 
 This gives a rule with teeth: **only those two packages may import both a concrete adapter
 and the application layer.** Everything else stays importable without dragging in a
@@ -228,8 +248,8 @@ Tests then stack up:
 
 - **domain rules** — many, in milliseconds, no infrastructure
 - **use cases** — against in-memory fakes of the ports
-- **adapters** — a few, against real Postgres and RabbitMQ via testcontainers
-- **end to end** — one run through all three services
+- **adapters** — the repository against real Postgres via testcontainers
+- **end to end** — deferred until the remote services exist
 
 **Not every service needs this.** notification-service consumes an event and calls an
 email provider. It has no rule that can fail, so it gets a consumer and an adapter —
@@ -241,36 +261,73 @@ getters, with all the real logic in `app/`. That looks like clean architecture a
 not. The test is simple: **can code in `domain/` return a business error?** If it
 cannot, the rules are in the wrong place.
 
+### Why inventory-service has fewer layers
+
+inventory-service applies that test and fails it, so it has **no `domain/` package at
+all** — application, two adapters, wiring, and nothing else.
+
+Its single rule is *available stock never drops below zero*, and that is a **contention**
+invariant rather than a modelling one. Contention invariants cannot be enforced in
+memory: an aggregate that reads stock, decides, and writes is a read-modify-write race
+however carefully it is modelled. Nothing an in-process object does can stop a second
+process reading the same row at the same instant. The rule therefore lives where the
+contention is resolved — in one conditional `UPDATE` and one `CHECK` constraint.
+
+A `domain/` package here would hold structs and getters, which is precisely the trap
+above. Order-service has four pieces because it has an aggregate with a lifecycle and
+transitions that can be refused; inventory has three because it does not. Mirroring the
+larger service by reflex would have proved the layering was a template rather than a
+decision.
+
+The visible consequence: inventory has no HTTP server, no Gin, and a `go.mod` noticeably
+shorter than order's.
+
 ---
 
 ## What happens when things fail halfway
 
-Placing an order crosses three services and two kinds of transport, so partial failure
-is normal rather than exceptional.
+Order creation deliberately persists local state before making the inventory call.
+There is no database transaction open across that external boundary.
 
 ```mermaid
 sequenceDiagram
     Client->>order: POST /orders
-    order->>inventory: ReserveStock (gRPC)
-    inventory-->>order: reservation id
-    order->>order: save order + outbox row (one transaction)
-    order->>RabbitMQ: OrderCreated (relay)
-    RabbitMQ->>notification: OrderCreated
+    order->>order: resolve system-owned prices
+    order->>Postgres: insert pending order + items
+    Postgres-->>order: committed OrderID
+    order->>inventory: ReserveStock (OrderID)
+    inventory-->>order: stock held
+    order->>Postgres: pending -> accepted (conditional update)
+    order->>notification: notify accepted order
+    order-->>Client: 201 accepted
 ```
 
 | What fails | The risk | How it is handled |
 | --- | --- | --- |
-| `ReserveStock` times out — did it reserve or not? | Retrying could reserve the stock twice | order sends a reservation key it generates itself. Inventory treats a repeat of the same key as the same reservation, so retrying is safe. |
-| Reservation succeeds, saving the order fails | Stock held for an order that does not exist | Reservations expire. Inventory releases anything unconfirmed after a set time, so the leak repairs itself — no second call that could also fail. |
-| Order saved, publishing `OrderCreated` fails | Order exists, notification never sent | The order row and an outbox row are written in **one** database transaction. A relay reads the outbox and publishes. The commit is the only thing that has to succeed. |
-| Relay publishes, then dies before marking the row sent | The event goes out twice | Accepted. Delivery is at-least-once. |
-| notification receives the same event twice | The customer gets two emails | Consumers record the event IDs they have handled and skip repeats. |
-| inventory is down | — | `POST /orders` fails fast with a clear error and no order is created. A confirmed order with no stock behind it is worse than a rejected one. |
+| Initial order insert fails | Inventory could reserve for an order that was never stored | Inventory is not called; the API returns `500`. |
+| Inventory is unavailable | An ambiguous call could be repeated and reserve twice | The same persisted OrderID and item lines are used for at most three attempts, with 100 ms and 200 ms waits. Inventory treats OrderID as its idempotency key. After the third failure, the order remains `pending` and the API returns `503`. |
+| Inventory reports insufficient stock | The order cannot be accepted | Inventory is not retried. The order is conditionally changed from `pending` to `rejected`, and the API returns `409`. |
+| Reservation succeeds but saving `accepted` fails | Inventory may hold stock while PostgreSQL still says `pending` | The API returns `500`. A later request with the same `Idempotency-Key` resumes the persisted order; the repeated OrderID returns the original reservation. There is currently no automated recovery. |
+| Two requests process the same pending order | Both may try to finish it | Both inventory calls are safe because they carry the same OrderID. The database update requires the expected `pending` state; the loser reloads and interprets the state that won. |
+| Notification fails after acceptance | Turning a durable accepted order into an API failure would invite unsafe client retries | The failure is logged and swallowed. A transactional outbox is the future replacement, but is not implemented here. |
 
-### When a consumer keeps failing
+The API never returns `pending` as success. A new accepted order returns `201`; an
+accepted idempotent replay returns `200`. A rejected replay returns the same
+insufficient-stock outcome without calling inventory again. A pending replay resumes
+inventory processing from the stored order snapshot, never from a new request body.
 
-The table above covers messages that go missing. This covers messages that arrive and
-cannot be processed.
+This leaves one deliberate limitation: without another client retry, a pending order
+and any associated reservation may remain pending indefinitely. Inventory expiry and
+automated recovery are outside the current boundary.
+
+Payment is also outside this lifecycle. `accepted` records the outcome of this order
+and inventory workflow and is not a payment status. A future payment workflow should
+introduce explicit payment-related states and policies rather than overload it.
+
+### Future messaging policy (not implemented)
+
+The transactional outbox, RabbitMQ relay, and consumer described below are design
+direction only. They remain out of scope for the current implementation.
 
 If notification's email provider is down, RabbitMQ redelivers the message. With no
 limit it redelivers forever: one bad message spins in a loop and holds up everything
@@ -315,36 +372,130 @@ consumer's own business and stay inside the consumer.
 **A parked queue nobody watches is silent data loss.** Depth above zero raises an
 alert.
 
+---
+
+## How inventory survives contention
+
+Many orders compete for the same stock rows at once. This is inventory-service's whole
+problem, and the answer is one statement:
+
+```sql
+UPDATE stock_items
+   SET reserved = reserved + $2
+ WHERE product_sku = $1
+   AND on_hand - reserved >= $2
+```
+
+Zero rows affected means the reservation failed. There is **no `SELECT … FOR UPDATE`
+first and no `SERIALIZABLE`**, because both exist to close a read-then-decide gap that
+this statement does not have: the check and the write are the same operation.
+
+The mechanism is worth stating because it is not obvious. Under `READ COMMITTED`, a
+transaction that blocks here on a row another transaction holds does **not** re-run
+against its original snapshot — PostgreSQL re-evaluates the `WHERE` clause against the
+newly committed version once the lock is released. So the loser sees the winner's
+decrement and matches zero rows. Lost updates are impossible without any explicit
+locking.
+
+Underneath it, one constraint states the rule the database itself will not let anything
+violate:
+
+```sql
+CONSTRAINT stock_items_reserved_within_stock CHECK (reserved <= on_hand)
+```
+
+### Where each race is handled
+
+| Race | How it is resolved |
+| --- | --- |
+| Two orders want the last unit | The conditional `UPDATE`; the loser's predicate is re-evaluated after the winner commits |
+| Orders `[A, B]` and `[B, A]` lock each other | Lines are **sorted by SKU** before any row is touched, so a lock cycle cannot form |
+| The same order id arrives twice at once | `order_id` is the primary key of `reservations`, claimed with `INSERT … ON CONFLICT DO NOTHING RETURNING` |
+| A response is lost and the caller retries | The recorded outcome is replayed; stock does not move again |
+| Line 3 of 5 has no stock | The transaction rolls back, putting back what lines 1–2 took |
+| Duplicate SKUs in one request | Summed during canonicalisation, with a checked sum that cannot overflow |
+| The same order id with different lines | Stored lines are compared; the call is refused rather than confirming stock nobody reserved |
+
+**Sorting is load-bearing, not tidiness.** Removing it and running the same concurrent
+test produces `SQLSTATE 40P01`, PostgreSQL killing one side of a deadlock. That is
+verified rather than assumed.
+
+**`ON CONFLICT DO NOTHING`, not a caught `23505`.** A raw unique violation aborts the
+transaction: every later statement fails with `25P02` until rollback, so there is no way
+to inspect the conflict and carry on. `ON CONFLICT` returns zero rows instead of
+erroring, and it blocks until the conflicting transaction resolves — so zero rows means
+the winner has already committed and the retry is guaranteed to see it.
+
+**Only successes are recorded.** `reservations` holds stock that is actually being held,
+and nothing else. A failed attempt writes no row, so retrying the same order id is a
+fresh attempt — an order refused while a product was sold out succeeds once the
+warehouse restocks.
+
+Storing failures was considered and rejected. It would have bought the property that one
+order id always gets the same answer, but at the price of permanently poisoning an order
+that could later be filled, which is the wrong trade for a shop. A failed reservation is
+not a reservation; it is an event, and it is already recorded by the gRPC interceptor
+with its status code. Keeping it out of the table also lets `reservations` carry a
+foreign key to `stock_items`, which would otherwise have to be dropped to make unknown
+products storable — and that foreign key then becomes the unknown-product check, so no
+separate existence query is needed at all.
+
+**Two tables, not three.** There is no separate reservation identifier and no header row
+to hold one. An order holds stock here at most once, so its own order id already names
+the hold; a second identifier would be a synonym, and a header table existing only to
+carry it would be a table whose entire content is another table's key. `order-service`
+therefore records nothing but `accepted`, which is itself the statement that the stock
+was secured.
+
+### What this leaves open
+
+A reservation is permanent. Nothing expires or releases it, so an order that fails after
+its stock is held keeps that stock indefinitely. This is the same limitation recorded
+above, seen from the other side, and it is why `reservations` stores the products and
+not just the order id: it is the only record of what stranded stock is being held for.
+
+---
+
 ### The rules that come out of this
 
-Four rules fall out, and they hold everywhere in the system:
+Three rules guide the distributed design:
 
-1. **Every call that changes something carries a key**, so retrying is safe.
-2. **Every hold on another service's data expires**, so nothing leaks when a later step
-   never happens.
-3. **Every consumer is idempotent**, because every hop delivers at least once.
-4. **Every consumer gives up eventually**, and parks the message where somebody will
-   see it. Retrying forever hides a problem instead of surfacing it.
+1. **Every retried state-changing call carries a stable key**, so retrying is safe.
+2. **Every future message consumer must be idempotent**, because message delivery will
+   be at least once.
+3. **Every future consumer must give up eventually**, and park the message where
+   somebody will see it. Retrying forever hides a problem instead of surfacing it.
 
 ---
 
 ## What CI enforces
 
-Because everything is in one repository, these checks are cheap and run on every pull
-request:
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `go vet`, the unit
+tests, and the `testcontainers` integration tests on every push and on every pull request
+targeting `main`. It runs them through the `make` targets rather than its own copy of the
+commands, and those targets loop over every Go module the `Makefile` discovers — so a service
+added later is covered without editing the workflow. Compose validation and `buf lint` remain
+local, in `make check`.
+
+The most valuable thing this already catches is a cross-service contract break. In separate
+repositories, a client calling a method the server no longer has becomes a runtime failure.
+Here `order-service/go.mod` replaces the contract module with a local path
+(`replace … => ../inventory-service/api`), so inventory removing a method order still calls is a
+compile error in the pull request that caused it.
+
+### Checks still to add
+
+As the deferred contracts and adapters arrive, CI should grow the following rather than claiming
+they already run:
 
 | Check | Catches |
 | --- | --- |
-| `go build ./...` | inventory removes a method order still calls — the gRPC client is verified against the server's contract **before merge** |
 | `buf breaking` | a change to `v1` that would break existing consumers |
 | `buf generate` + `git diff --exit-code` | someone edited a `.proto` and forgot to regenerate |
+| `gofmt -l` | unformatted code (`make fmt` rewrites files, so CI needs the read-only form) |
 | import-boundary script | one service importing another service's internal code instead of its `api` package |
 | domain-purity script | any `domain/` package importing a database, network, or queue library |
 | `go test ./internal/.../domain/...` with nothing else running | the domain quietly growing a dependency on infrastructure |
-
-The first row is the one worth pausing on. In separate repositories, a client calling
-a method the server no longer has is a runtime failure found in production. Here it is
-a compiler error found in the pull request that caused it.
 
 ---
 
