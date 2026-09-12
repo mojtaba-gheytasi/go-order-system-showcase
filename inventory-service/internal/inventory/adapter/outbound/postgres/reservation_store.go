@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/rs/zerolog"
 
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/inventory-service/internal/inventory/application"
 )
@@ -15,13 +18,14 @@ import (
 const foreignKeyViolation = "23503"
 
 type ReservationStore struct {
-	db *sql.DB
+	db     *sql.DB
+	logger zerolog.Logger
 }
 
 var _ application.ReservationStore = (*ReservationStore)(nil)
 
-func NewReservationStore(db *sql.DB) *ReservationStore {
-	return &ReservationStore{db: db}
+func NewReservationStore(db *sql.DB, logger zerolog.Logger) *ReservationStore {
+	return &ReservationStore{db: db, logger: logger}
 }
 
 func (store *ReservationStore) Find(
@@ -65,12 +69,28 @@ func (store *ReservationStore) Find(
 	return lines, nil
 }
 
-// Claim holds stock for every line in one transaction. It is all or nothing. 
+// A refusal names only the line that tripped it, because the claim stops at the
+// first one. describeFailure turns that into the whole picture, so a caller can
+// correct its request in one round trip rather than one line per attempt.
+func (store *ReservationStore) Claim(
+	ctx context.Context,
+	orderID string,
+	lines []application.Line,
+) error {
+	err := store.claim(ctx, orderID, lines)
+	if err == nil {
+		return nil
+	}
+
+	return store.describeFailure(ctx, err, lines)
+}
+
+// claim is the transaction itself.
 //
 // The caller passes canonical lines, which are sorted by SKU. That ordering is
 // load-bearing: it fixes the sequence stock rows are locked in, so two requests
 // covering the same products can never hold each other's next row.
-func (store *ReservationStore) Claim(
+func (store *ReservationStore) claim(
 	ctx context.Context,
 	orderID string,
 	lines []application.Line,
@@ -184,6 +204,113 @@ func takeStock(ctx context.Context, transaction *sql.Tx, line application.Line) 
 	}
 
 	return nil
+}
+
+func (store *ReservationStore) describeFailure(
+	ctx context.Context,
+	claimErr error,
+	lines []application.Line,
+) error {
+	describable := errors.Is(claimErr, application.ErrUnknownProductSKU) ||
+		errors.Is(claimErr, application.ErrInsufficientStock)
+	if describable == false {
+		return claimErr
+	}
+
+	available, err := store.availability(ctx, lines)
+	if err != nil {
+		store.logger.Warn().
+			Ctx(ctx).
+			Err(err).
+			Msg("could not describe a refused claim")
+
+		return claimErr
+	}
+
+	// Canonical lines arrive sorted, but sorting here too means the promise that
+	// these lists are ordered does not rest on a caller keeping its side of a
+	// contract.
+	unknown := make([]string, 0)
+	for _, line := range lines {
+		if _, stocked := available[line.ProductSKU]; stocked == false {
+			unknown = append(unknown, line.ProductSKU)
+		}
+	}
+
+	// A product that does not exist is not a product that is short, so it
+	// answers first: NOT_FOUND is the more specific verdict.
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+
+		return &application.UnknownProductSKUError{ProductSKUs: unknown}
+	}
+
+	shortfalls := make([]application.Shortfall, 0)
+	for _, line := range lines {
+		if free := available[line.ProductSKU]; free < line.Quantity {
+			shortfalls = append(shortfalls, application.Shortfall{
+				ProductSKU: line.ProductSKU,
+				Requested:  line.Quantity,
+				Available:  free,
+			})
+		}
+	}
+
+	// Nothing is short any more, so the warehouse was restocked between the
+	// refusal and this query. An empty list would report insufficient stock and
+	// name nothing responsible for it, which is worse than saying less.
+	if len(shortfalls) == 0 {
+		return claimErr
+	}
+
+	slices.SortFunc(shortfalls, func(first, second application.Shortfall) int {
+		return strings.Compare(first.ProductSKU, second.ProductSKU)
+	})
+
+	return &application.InsufficientStockError{Shortfalls: shortfalls}
+}
+
+// availability reports what is free for each requested product. A SKU missing
+// from the result is one this warehouse does not stock at all.
+func (store *ReservationStore) availability(
+	ctx context.Context,
+	lines []application.Line,
+) (map[string]int32, error) {
+	productSKUs := make([]string, 0, len(lines))
+	for _, line := range lines {
+		productSKUs = append(productSKUs, line.ProductSKU)
+	}
+
+	rows, err := store.db.QueryContext(
+		ctx,
+		`SELECT product_sku, on_hand - reserved
+		   FROM stock_items
+		  WHERE product_sku = ANY($1::text[])`,
+		productSKUs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query availability: %w", err)
+	}
+	defer rows.Close()
+
+	available := make(map[string]int32, len(productSKUs))
+	for rows.Next() {
+		var (
+			productSKU string
+			free       int32
+		)
+		if err := rows.Scan(&productSKU, &free); err != nil {
+			return nil, fmt.Errorf("scan availability: %w", err)
+		}
+
+		available[productSKU] = free
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate availability: %w", err)
+	}
+
+	return available, nil
 }
 
 func rowsAffected(result sql.Result, productSKU string) (int64, error) {
