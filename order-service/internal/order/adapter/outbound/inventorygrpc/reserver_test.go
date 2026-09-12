@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
@@ -19,6 +22,7 @@ import (
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/inventorygrpc"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/domain"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/correlation"
 )
 
 func testRequest() application.ReservationRequest {
@@ -112,6 +116,30 @@ func TestReserveTurnsAStalledCallIntoARetryableError(t *testing.T) {
 	require.ErrorIs(t, err, application.ErrInventoryUnavailable)
 }
 
+// Inventory's INTERNAL says only that it is broken, never how. The request id is
+// the thread from a customer's failed order to the log line over there that
+// explains it, so it has to arrive on the call.
+func TestReserveSendsTheRequestIDToInventory(t *testing.T) {
+	inventory := &fakeInventory{}
+	reserver := newReserver(t, inventory, time.Second)
+
+	ctx := correlation.WithRequestID(context.Background(), "probe-123")
+	require.NoError(t, reserver.Reserve(ctx, testRequest()))
+
+	assert.Equal(t, []string{"probe-123"}, inventory.receivedRequestIDs())
+}
+
+// A call without an id is normal. It must not put an empty one on the wire,
+// which would be indistinguishable from a caller that sent a blank id.
+func TestReserveSendsNoRequestIDWhenThereIsNone(t *testing.T) {
+	inventory := &fakeInventory{}
+	reserver := newReserver(t, inventory, time.Second)
+
+	require.NoError(t, reserver.Reserve(context.Background(), testRequest()))
+
+	assert.Empty(t, inventory.receivedRequestIDs())
+}
+
 // --- helpers -------------------------------------------------------------
 
 func newReserver(
@@ -135,6 +163,9 @@ func newReserver(
 			return listener.DialContext(ctx)
 		}),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		// The same interceptor bootstrap registers, so these tests exercise the
+		// connection the process actually makes.
+		grpc.WithChainUnaryInterceptor(inventorygrpc.Correlation()),
 	)
 	require.NoError(t, err)
 
@@ -152,12 +183,36 @@ type fakeInventory struct {
 
 	err   error
 	delay time.Duration
+
+	mutex      sync.Mutex
+	requestIDs []string
+}
+
+// receivedRequestIDs reports the correlation ids that arrived in call metadata.
+func (inventory *fakeInventory) receivedRequestIDs() []string {
+	inventory.mutex.Lock()
+	defer inventory.mutex.Unlock()
+
+	return slices.Clone(inventory.requestIDs)
+}
+
+func (inventory *fakeInventory) recordRequestID(ctx context.Context) {
+	incoming, found := metadata.FromIncomingContext(ctx)
+	if found == false {
+		return
+	}
+
+	inventory.mutex.Lock()
+	defer inventory.mutex.Unlock()
+	inventory.requestIDs = append(inventory.requestIDs, incoming.Get(correlation.MetadataKey)...)
 }
 
 func (inventory *fakeInventory) ReserveStock(
 	ctx context.Context,
 	_ *inventoryv1.ReserveStockRequest,
 ) (*inventoryv1.ReserveStockResponse, error) {
+	inventory.recordRequestID(ctx)
+
 	if inventory.delay > 0 {
 		select {
 		case <-time.After(inventory.delay):

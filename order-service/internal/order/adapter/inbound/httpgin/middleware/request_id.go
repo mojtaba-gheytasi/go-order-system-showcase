@@ -6,21 +6,20 @@ import (
 	"encoding/hex"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/correlation"
 )
 
-const HeaderRequestID = "X-Request-ID"
+// HeaderRequestID is re-exported so handlers and tests in this package keep
+// naming the header through the middleware that sets it.
+const HeaderRequestID = correlation.HeaderRequestID
 
-const (
-	maxInboundRequestIDLength = 64
-	generatedRequestIDBytes   = 16
-)
-
-type requestIDContextKey struct{}
+const generatedRequestIDBytes = 16
 
 // RequestID gives every request a correlation id
 func RequestID() gin.HandlerFunc {
 	return func(context *gin.Context) {
-		requestID := acceptableRequestID(context.GetHeader(HeaderRequestID))
+		requestID := correlation.Acceptable(context.GetHeader(HeaderRequestID))
 		if requestID == "" {
 			requestID = generateRequestID()
 		}
@@ -35,33 +34,11 @@ func RequestID() gin.HandlerFunc {
 }
 
 func WithRequestID(ctx context.Context, requestID string) context.Context {
-	return context.WithValue(ctx, requestIDContextKey{}, requestID)
+	return correlation.WithRequestID(ctx, requestID)
 }
 
 func RequestIDFromContext(ctx context.Context) string {
-	requestID, _ := ctx.Value(requestIDContextKey{}).(string)
-
-	return requestID
-}
-
-func acceptableRequestID(requestID string) string {
-	if requestID == "" || len(requestID) > maxInboundRequestIDLength {
-		return ""
-	}
-
-	for _, character := range requestID {
-		switch {
-		case character >= 'a' && character <= 'z',
-			character >= 'A' && character <= 'Z',
-			character >= '0' && character <= '9',
-			character == '-',
-			character == '_':
-		default:
-			return ""
-		}
-	}
-
-	return requestID
+	return correlation.FromContext(ctx)
 }
 
 func generateRequestID() string {

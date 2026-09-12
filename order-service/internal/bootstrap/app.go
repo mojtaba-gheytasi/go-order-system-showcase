@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/inventorygrpc"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/wiring"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/config"
 	platformdatabase "github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/database"
@@ -55,6 +56,7 @@ func New(
 	inventoryConn, err := grpc.NewClient(
 		applicationConfig.InventoryGRPCAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(inventorygrpc.Correlation()),
 	)
 	if err != nil {
 		_ = db.Close()
