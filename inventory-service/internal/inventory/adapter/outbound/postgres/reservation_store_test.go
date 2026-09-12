@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -26,7 +28,7 @@ import (
 func TestClaimReservesStockAndRecordsTheRequest(t *testing.T) {
 	ctx := context.Background()
 	db := startPostgres(t, ctx)
-	store := postgres.NewReservationStore(db)
+	store := newStore(db)
 	seedStock(t, ctx, db, map[string]int{"SKU-A": 10, "SKU-B": 4})
 
 	orderID := newUUID(t)
@@ -51,7 +53,7 @@ func TestClaimReservesStockAndRecordsTheRequest(t *testing.T) {
 func TestConcurrentClaimsNeverOverbookAProduct(t *testing.T) {
 	ctx := context.Background()
 	db := startPostgres(t, ctx)
-	store := postgres.NewReservationStore(db)
+	store := newStore(db)
 
 	const (
 		onHand    = 20
@@ -109,7 +111,7 @@ func TestConcurrentClaimsNeverOverbookAProduct(t *testing.T) {
 func TestConcurrentClaimsOnOppositeLineOrdersDoNotDeadlock(t *testing.T) {
 	ctx := context.Background()
 	db := startPostgres(t, ctx)
-	store := postgres.NewReservationStore(db)
+	store := newStore(db)
 	seedStock(t, ctx, db, map[string]int{"SKU-A": 500, "SKU-B": 500})
 
 	const attempts = 40
@@ -156,7 +158,7 @@ func TestConcurrentClaimsOnOppositeLineOrdersDoNotDeadlock(t *testing.T) {
 func TestConcurrentClaimsOnTheSameOrderIDProduceOneReservation(t *testing.T) {
 	ctx := context.Background()
 	db := startPostgres(t, ctx)
-	store := postgres.NewReservationStore(db)
+	store := newStore(db)
 	seedStock(t, ctx, db, map[string]int{"SKU-A": 100})
 
 	const attempts = 16
@@ -208,7 +210,7 @@ func TestConcurrentClaimsOnTheSameOrderIDProduceOneReservation(t *testing.T) {
 func TestClaimRollsBackEarlyLinesWhenALaterLineHasNoStock(t *testing.T) {
 	ctx := context.Background()
 	db := startPostgres(t, ctx)
-	store := postgres.NewReservationStore(db)
+	store := newStore(db)
 	seedStock(t, ctx, db, map[string]int{"SKU-A": 10, "SKU-B": 10, "SKU-C": 1})
 
 	orderID := newUUID(t)
@@ -235,7 +237,7 @@ func TestClaimRollsBackEarlyLinesWhenALaterLineHasNoStock(t *testing.T) {
 func TestAFailedAttemptCanSucceedAfterRestocking(t *testing.T) {
 	ctx := context.Background()
 	db := startPostgres(t, ctx)
-	store := postgres.NewReservationStore(db)
+	store := newStore(db)
 	seedStock(t, ctx, db, map[string]int{"SKU-A": 1})
 
 	orderID := newUUID(t)
@@ -255,7 +257,7 @@ func TestAFailedAttemptCanSucceedAfterRestocking(t *testing.T) {
 func TestUnknownProductIsReportedAndRecordsNothing(t *testing.T) {
 	ctx := context.Background()
 	db := startPostgres(t, ctx)
-	store := postgres.NewReservationStore(db)
+	store := newStore(db)
 	seedStock(t, ctx, db, map[string]int{"SKU-A": 10})
 
 	err := store.Claim(ctx, newUUID(t), []application.Line{
@@ -267,16 +269,157 @@ func TestUnknownProductIsReportedAndRecordsNothing(t *testing.T) {
 	assert.Equal(t, 0, reservationCount(t, ctx, db))
 }
 
+// The claim stops at the first line it cannot fill, but the caller has a whole
+// basket to correct. Every short line is reported, so fixing it takes one round
+// trip rather than one per bad line.
+func TestClaimReportsEveryShortLineNotJustTheFirst(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	store := newStore(db)
+	seedStock(t, ctx, db, map[string]int{"SKU-A": 2, "SKU-B": 10, "SKU-C": 0})
+
+	err := store.Claim(ctx, newUUID(t), []application.Line{
+		{ProductSKU: "SKU-A", Quantity: 5},
+		{ProductSKU: "SKU-B", Quantity: 1},
+		{ProductSKU: "SKU-C", Quantity: 3},
+	})
+
+	require.ErrorIs(t, err, application.ErrInsufficientStock)
+
+	var insufficient *application.InsufficientStockError
+	require.ErrorAs(t, err, &insufficient)
+	assert.Equal(t, []application.Shortfall{
+		{ProductSKU: "SKU-A", Requested: 5, Available: 2},
+		{ProductSKU: "SKU-C", Requested: 3, Available: 0},
+	}, insufficient.Shortfalls, "SKU-B could be filled, so it is not reported")
+}
+
+// What is already promised to other orders is not available to this one.
+func TestShortfallCountsReservedStockAsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	store := newStore(db)
+	seedStock(t, ctx, db, map[string]int{"SKU-A": 10})
+
+	require.NoError(t, store.Claim(ctx, newUUID(t), []application.Line{
+		{ProductSKU: "SKU-A", Quantity: 8},
+	}))
+
+	err := store.Claim(ctx, newUUID(t), []application.Line{{ProductSKU: "SKU-A", Quantity: 5}})
+
+	var insufficient *application.InsufficientStockError
+	require.ErrorAs(t, err, &insufficient)
+	assert.Equal(t, []application.Shortfall{
+		{ProductSKU: "SKU-A", Requested: 5, Available: 2},
+	}, insufficient.Shortfalls)
+}
+
+// An unknown product is rejected by a foreign key, which leaves the transaction
+// aborted — every later statement on it would fail. The diagnosis therefore has
+// to run on its own connection, and this is the test that proves it does.
+func TestClaimReportsEveryUnknownProduct(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	store := newStore(db)
+	seedStock(t, ctx, db, map[string]int{"SKU-A": 10})
+
+	err := store.Claim(ctx, newUUID(t), []application.Line{
+		{ProductSKU: "SKU-A", Quantity: 1},
+		{ProductSKU: "SKU-GHOST", Quantity: 1},
+		{ProductSKU: "SKU-PHANTOM", Quantity: 1},
+	})
+
+	require.ErrorIs(t, err, application.ErrUnknownProductSKU)
+
+	var unknown *application.UnknownProductSKUError
+	require.ErrorAs(t, err, &unknown)
+	assert.Equal(t, []string{"SKU-GHOST", "SKU-PHANTOM"}, unknown.ProductSKUs)
+}
+
+// A product that does not exist is not a product that is short. NOT_FOUND is the
+// more specific verdict, so it wins even when the basket also cannot be filled.
+func TestUnknownProductsAnswerBeforeShortfalls(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	store := newStore(db)
+	seedStock(t, ctx, db, map[string]int{"SKU-A": 1})
+
+	err := store.Claim(ctx, newUUID(t), []application.Line{
+		{ProductSKU: "SKU-A", Quantity: 99},
+		{ProductSKU: "SKU-GHOST", Quantity: 1},
+	})
+
+	require.ErrorIs(t, err, application.ErrUnknownProductSKU)
+	assert.NotErrorIs(t, err, application.ErrInsufficientStock)
+}
+
+// The diagnosis runs after the claim, so stock can move in between: a claim can
+// be refused and the shortfall be gone by the time anything asks what was short.
+//
+// Which way that race falls is not the property worth pinning. This is: a
+// shortfall error always names something. Reporting insufficient stock while
+// naming nothing responsible for it would be worse than saying less, so that
+// case must fall back to the plain refusal.
+func TestAShortfallErrorNeverNamesNothing(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	store := newStore(db)
+	seedStock(t, ctx, db, map[string]int{"SKU-A": 1})
+
+	// Restocking under a stream of claims makes both orderings happen.
+	for attempt := range 25 {
+		exhaust(t, ctx, db, "SKU-A")
+
+		claimed := make(chan error, 1)
+		go func() {
+			claimed <- store.Claim(ctx, newUUID(t), []application.Line{
+				{ProductSKU: "SKU-A", Quantity: 1},
+			})
+		}()
+		restock(t, ctx, db, "SKU-A", 500)
+
+		err := <-claimed
+
+		var insufficient *application.InsufficientStockError
+		if errors.As(err, &insufficient) {
+			require.NotEmptyf(
+				t,
+				insufficient.Shortfalls,
+				"attempt %d reported insufficient stock without naming a line",
+				attempt,
+			)
+		}
+	}
+}
+
 func TestFindReportsAMissingReservation(t *testing.T) {
 	ctx := context.Background()
 	db := startPostgres(t, ctx)
 
-	_, err := postgres.NewReservationStore(db).Find(ctx, newUUID(t))
+	_, err := newStore(db).Find(ctx, newUUID(t))
 
 	require.ErrorIs(t, err, application.ErrReservationNotFound)
 }
 
 // --- helpers -------------------------------------------------------------
+
+func newStore(db *sql.DB) *postgres.ReservationStore {
+	return postgres.NewReservationStore(db, zerolog.New(io.Discard))
+}
+
+// exhaust leaves a product with nothing free, without disturbing what is already
+// reserved — dropping on_hand below reserved would break the schema's own
+// invariant rather than producing the situation under test.
+func exhaust(t *testing.T, ctx context.Context, db *sql.DB, productSKU string) {
+	t.Helper()
+
+	_, err := db.ExecContext(
+		ctx,
+		`UPDATE stock_items SET on_hand = reserved WHERE product_sku = $1`,
+		productSKU,
+	)
+	require.NoError(t, err)
+}
 
 func startPostgres(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()

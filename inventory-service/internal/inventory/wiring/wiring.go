@@ -34,7 +34,7 @@ type Module struct {
 
 func New(dependencies Dependencies) (*Module, error) {
 	reserveStock := application.NewReserveStock(
-		inventorypostgres.NewReservationStore(dependencies.DB),
+		inventorypostgres.NewReservationStore(dependencies.DB, dependencies.Logger),
 		dependencies.Logger,
 	)
 
@@ -54,9 +54,12 @@ func New(dependencies Dependencies) (*Module, error) {
 			healthServer.SetServingStatus("", healthv1.HealthCheckResponse_SERVING)
 			healthv1.RegisterHealthServer(server, healthServer)
 		},
-		// Health checks run every few seconds forever; logging them would bury
-		// the calls that carry information.
 		UnaryInterceptors: []grpc.UnaryServerInterceptor{
+			// Correlation runs first so that everything after it, the log line
+			// included, can name the caller's request.
+			grpcapi.Correlation(),
+			// Health checks run every few seconds forever; logging them would
+			// bury the calls that carry information.
 			grpcapi.Logging(dependencies.Logger, healthMethod),
 		},
 	}, nil
