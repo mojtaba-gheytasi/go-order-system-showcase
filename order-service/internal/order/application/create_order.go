@@ -254,15 +254,26 @@ func (useCase *CreateOrder) buildOrder(
 		return nil, fmt.Errorf("resolve product prices: %w", err)
 	}
 
+	// Every unpriced product is collected before giving up, so a customer with
+	// several bad skus learns about all of them at once instead of one per
+	// attempt.
+	missing := make([]string, 0)
+	for _, commandItem := range command.Items {
+		productSKU := strings.TrimSpace(commandItem.ProductSKU)
+		if _, found := prices[productSKU]; found == false {
+			missing = append(missing, productSKU)
+		}
+	}
+
+	if len(missing) > 0 {
+		return nil, &ProductNotFoundError{ProductSKUs: missing}
+	}
+
 	items := make([]domain.OrderItem, 0, len(command.Items))
 	for _, commandItem := range command.Items {
 		productSKU := strings.TrimSpace(commandItem.ProductSKU)
-		price, found := prices[productSKU]
-		if found == false {
-			return nil, fmt.Errorf("%w: product %q", ErrProductNotFound, productSKU)
-		}
 
-		item, err := domain.NewOrderItem(productSKU, commandItem.Quantity, price)
+		item, err := domain.NewOrderItem(productSKU, commandItem.Quantity, prices[productSKU])
 		if err != nil {
 			return nil, err
 		}

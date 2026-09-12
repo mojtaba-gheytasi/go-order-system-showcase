@@ -342,6 +342,23 @@ func TestCreateOrderRejectsAProductMissingFromTheCatalogResponse(t *testing.T) {
 
 	require.ErrorIs(t, err, application.ErrProductNotFound)
 	assert.Equal(t, 0, dependencies.reserver.calls)
+
+	var notFound *application.ProductNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.Equal(t, []string{"SKU-B"}, notFound.ProductSKUs)
+}
+
+// Naming only the first unpriced product would cost a customer one attempt per
+// bad sku, so all of them are collected before giving up.
+func TestCreateOrderNamesEveryProductTheCatalogCouldNotPrice(t *testing.T) {
+	dependencies := newDependencies()
+	dependencies.catalog.prices = map[string]domain.Money{}
+
+	_, err := dependencies.useCase().Execute(context.Background(), testCommand())
+
+	var notFound *application.ProductNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.Equal(t, []string{"SKU-A", "SKU-B"}, notFound.ProductSKUs)
 }
 
 func TestCreateOrderDoesNotCallInventoryWhenInitialPersistenceFails(t *testing.T) {

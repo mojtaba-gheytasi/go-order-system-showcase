@@ -61,3 +61,15 @@ func (err *InsufficientStockError) Error() string {
 }
 
 func (err *InsufficientStockError) Unwrap() error { return ErrInsufficientStock }
+
+// ProductNotFoundError names every product the catalog could not price, rather
+// than the first one, for the same reason the shortfalls are reported together.
+type ProductNotFoundError struct {
+	ProductSKUs []string
+}
+
+func (err *ProductNotFoundError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrProductNotFound, strings.Join(err.ProductSKUs, ", "))
+}
+
+func (err *ProductNotFoundError) Unwrap() error { return ErrProductNotFound }

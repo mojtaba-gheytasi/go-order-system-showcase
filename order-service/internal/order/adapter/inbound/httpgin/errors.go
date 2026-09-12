@@ -87,9 +87,20 @@ func respondInternalError(context *gin.Context) {
 func respondUseCaseError(context *gin.Context, err error) {
 	_ = context.Error(err)
 
-	var insufficientStock *application.InsufficientStockError
+	var (
+		insufficientStock *application.InsufficientStockError
+		productNotFound   *application.ProductNotFoundError
+	)
 
 	switch {
+	case errors.As(err, &productNotFound):
+		respondErrorWithDetails(
+			context,
+			http.StatusUnprocessableEntity,
+			codeProductNotFound,
+			"one or more products do not exist",
+			gin.H{"product_skus": productNotFound.ProductSKUs},
+		)
 	case errors.Is(err, application.ErrProductNotFound):
 		respondError(
 			context,
