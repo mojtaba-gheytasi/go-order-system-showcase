@@ -95,3 +95,60 @@ func TestCanonicalizeRejectsBadRequests(t *testing.T) {
 		})
 	}
 }
+
+// A caller that fixes one field at a time needs one round trip per mistake, so
+// everything wrong with a request is answered at once.
+func TestCanonicalizeReportsEveryViolationAtOnce(t *testing.T) {
+	_, _, err := application.Canonicalize("not-a-uuid", []application.Line{
+		{ProductSKU: "SKU-A", Quantity: 1},
+		{ProductSKU: "  ", Quantity: 1},
+		{ProductSKU: "SKU-C", Quantity: 0},
+	})
+
+	var invalid *application.InvalidRequestError
+	require.ErrorAs(t, err, &invalid)
+	require.ErrorIs(t, err, application.ErrInvalidRequest, "the sentinel still answers")
+
+	// Field paths index the request as the caller sent it, so they are
+	// zero-based and name the line that has to change.
+	assert.Equal(t, []application.FieldViolation{
+		{Field: "order_id", Description: "must be a uuid"},
+		{Field: "lines[1].product_sku", Description: "must not be blank"},
+		{Field: "lines[2].quantity", Description: "must be between 1 and 10000, got 0"},
+	}, invalid.Violations)
+	assert.Zero(t, invalid.Omitted)
+}
+
+// A request can be wrong in as many places as it has lines. How large the error
+// response gets cannot be the caller's decision.
+func TestCanonicalizeCapsTheViolationsItReports(t *testing.T) {
+	lines := make([]application.Line, 0, 30)
+	for range 30 {
+		lines = append(lines, application.Line{ProductSKU: "SKU-A", Quantity: 0})
+	}
+
+	_, _, err := application.Canonicalize(testOrderID, lines)
+
+	var invalid *application.InvalidRequestError
+	require.ErrorAs(t, err, &invalid)
+	assert.Len(t, invalid.Violations, 20)
+	assert.Equal(t, 10, invalid.Omitted, "the rest are counted, not listed")
+}
+
+// Past the line cap the request is refused whole, so walking its lines could
+// only describe a request that is already rejected.
+func TestCanonicalizeDoesNotDescribeLinesItNeverValidates(t *testing.T) {
+	lines := make([]application.Line, 0, 201)
+	for range 201 {
+		lines = append(lines, application.Line{ProductSKU: "", Quantity: 0})
+	}
+
+	_, _, err := application.Canonicalize(testOrderID, lines)
+
+	var invalid *application.InvalidRequestError
+	require.ErrorAs(t, err, &invalid)
+	assert.Equal(t, []application.FieldViolation{
+		{Field: "lines", Description: "at most 200 lines are supported, got 201"},
+	}, invalid.Violations)
+	assert.Zero(t, invalid.Omitted)
+}
