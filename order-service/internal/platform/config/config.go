@@ -16,19 +16,20 @@ import (
 const localEnvironmentFile = ".env"
 
 type Config struct {
-	Environment            string        `mapstructure:"ENVIRONMENT" validate:"required,oneof=development test staging production"`
-	DatabaseURL            string        `mapstructure:"DATABASE_URL" validate:"required"`
-	DBMaxOpenConns         int           `mapstructure:"DB_MAX_OPEN_CONNS" validate:"gt=0"`
-	DBMaxIdleConns         int           `mapstructure:"DB_MAX_IDLE_CONNS" validate:"gte=0"`
-	DBConnMaxLifetime      time.Duration `mapstructure:"DB_CONN_MAX_LIFETIME" validate:"gt=0"`
-	HTTPServerAddress      string        `mapstructure:"HTTP_SERVER_ADDRESS" validate:"required"`
-	HTTPReadHeaderTimeout  time.Duration `mapstructure:"HTTP_READ_HEADER_TIMEOUT" validate:"gt=0"`
-	HTTPReadTimeout        time.Duration `mapstructure:"HTTP_READ_TIMEOUT" validate:"gt=0"`
-	HTTPWriteTimeout       time.Duration `mapstructure:"HTTP_WRITE_TIMEOUT" validate:"gt=0"`
-	HTTPIdleTimeout        time.Duration `mapstructure:"HTTP_IDLE_TIMEOUT" validate:"gt=0"`
-	LogLevel               string        `mapstructure:"LOG_LEVEL" validate:"required,oneof=trace debug info warn error fatal panic disabled"`
-	LogCaller              *bool         `mapstructure:"LOG_CALLER" validate:"required"`
-	InventoryGRPCAddress   string        `mapstructure:"INVENTORY_GRPC_ADDRESS" validate:"required"`
+	Environment           string        `mapstructure:"ENVIRONMENT" validate:"required,oneof=development test staging production"`
+	DatabaseURL           string        `mapstructure:"DATABASE_URL" validate:"required"`
+	DBMaxOpenConns        int           `mapstructure:"DB_MAX_OPEN_CONNS" validate:"gt=0"`
+	DBMaxIdleConns        int           `mapstructure:"DB_MAX_IDLE_CONNS" validate:"gte=0"`
+	DBConnMaxLifetime     time.Duration `mapstructure:"DB_CONN_MAX_LIFETIME" validate:"gt=0"`
+	HTTPServerAddress     string        `mapstructure:"HTTP_SERVER_ADDRESS" validate:"required"`
+	HTTPReadHeaderTimeout time.Duration `mapstructure:"HTTP_READ_HEADER_TIMEOUT" validate:"gt=0"`
+	HTTPReadTimeout       time.Duration `mapstructure:"HTTP_READ_TIMEOUT" validate:"gt=0"`
+	HTTPWriteTimeout      time.Duration `mapstructure:"HTTP_WRITE_TIMEOUT" validate:"gt=0"`
+	HTTPIdleTimeout       time.Duration `mapstructure:"HTTP_IDLE_TIMEOUT" validate:"gt=0"`
+	LogLevel              string        `mapstructure:"LOG_LEVEL" validate:"required,oneof=trace debug info warn error fatal panic disabled"`
+	LogCaller             *bool         `mapstructure:"LOG_CALLER" validate:"required"`
+	InventoryGRPCAddress  string        `mapstructure:"INVENTORY_GRPC_ADDRESS" validate:"required"`
+	InventoryGRPCTimeout  time.Duration `mapstructure:"INVENTORY_GRPC_TIMEOUT" validate:"gt=0"`
 }
 
 func Load(path string) (Config, error) {
