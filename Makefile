@@ -3,7 +3,8 @@
 PROJECT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ORDER_DIR := $(PROJECT_DIR)/order-service
 INVENTORY_DIR := $(PROJECT_DIR)/inventory-service
-API_DIR := $(INVENTORY_DIR)/api
+INVENTORY_API_DIR := $(INVENTORY_DIR)/api
+ORDER_API_DIR := $(ORDER_DIR)/api
 
 ORDER_ENV := $(ORDER_DIR)/.env
 ORDER_ENV_FILE := $(if $(wildcard $(ORDER_ENV)),$(ORDER_ENV),$(ORDER_DIR)/.env.example)
@@ -17,6 +18,13 @@ COMPOSE := docker compose --project-directory $(PROJECT_DIR) -f $(PROJECT_DIR)/d
 # test as soon as it has a go.mod — without editing this file or the CI workflow.
 GO_MODULES := $(sort $(patsubst %/,%,$(dir $(shell find $(PROJECT_DIR) -name go.mod \
 	-not -path '*/.git/*' -not -path '*/vendor/*' -not -path '*/testdata/*'))))
+
+# Every buf module, discovered the same way and for the same reason. A service that
+# publishes a protobuf contract has a buf.yaml beside it and is covered; a service
+# that has no contract has no buf.yaml and is skipped, without anyone having to
+# exclude it from a list at the root.
+BUF_MODULES := $(sort $(patsubst %/,%,$(dir $(shell find $(PROJECT_DIR) -name buf.yaml \
+	-not -path '*/.git/*' -not -path '*/vendor/*'))))
 
 -include $(ORDER_ENV)
 -include $(INVENTORY_ENV)
@@ -115,14 +123,60 @@ inventory-seed: ## Reapply the development stock seed
 
 # --- contracts --------------------------------------------------------------
 
+# Each contract module is its own buf workspace, so every target below runs buf once
+# per module from inside it. That is not merely tidiness: a single workspace at the
+# root would let one service's .proto import another's and resolve it, so a change to
+# one contract could break another service's generated code. Separate workspaces make
+# that import fail, which turns the boundary from a convention into a rule.
+#
+# Generated into a temporary directory and swapped in only once buf has succeeded.
+#
+# The obvious version — delete gen/, then generate — is a trap: any failure mid-run
+# (a rate-limited plugin registry, a malformed .proto) leaves the module with no
+# generated code at all, and for a module not yet committed there is nothing to
+# restore it from. Swapping at the end means a failed run changes nothing.
+#
+# The swap still replaces the directory wholesale rather than merging, so deleting a
+# .proto removes its .pb.go. Generating over the top would leave it behind forever:
+# still compiling, still importable, no longer backed by a contract.
 proto: ## Generate Go code from the protobuf contracts
-	cd $(PROJECT_DIR) && buf generate
+	@for module in $(BUF_MODULES); do \
+		echo "==> $$module"; \
+		staging=$$(mktemp -d) || exit 1; \
+		if (cd $$module && buf generate --output $$staging proto); then \
+			rm -rf $$module/gen && mv $$staging/gen $$module/gen; \
+		else \
+			rm -rf $$staging; \
+			echo "generation failed; $$module/gen left untouched" >&2; \
+			exit 1; \
+		fi; \
+	done
 
 proto-lint: ## Lint the protobuf contracts
-	cd $(PROJECT_DIR) && buf lint
+	@for module in $(BUF_MODULES); do \
+		echo "==> $$module" && cd $$module && buf lint || exit 1; \
+	done
 
+# Compared against main per module. The subdir qualifier is what lets buf find this
+# module inside the repository it clones, since the module no longer sits at the root
+# of a workspace spanning everything.
+#
+# A module that main does not have yet is skipped rather than failed. buf reports an
+# absent module as "had no .proto files", which would fail the very pull request that
+# introduces a contract — so the check states plainly that a new contract is
+# unprotected until it lands, instead of either crashing or pretending it checked
+# something.
 proto-breaking: ## Check the contracts for breaking changes against main
-	cd $(PROJECT_DIR) && buf breaking --against '.git#branch=main'
+	@for module in $(BUF_MODULES); do \
+		subdir=$${module#$(PROJECT_DIR)/}; \
+		if git -C $(PROJECT_DIR) rev-parse --verify --quiet main >/dev/null && \
+		   git -C $(PROJECT_DIR) ls-tree -d --name-only main -- $$subdir | grep -q .; then \
+			echo "==> $$subdir" && cd $$module && \
+			buf breaking --against "$(PROJECT_DIR)/.git#branch=main,subdir=$$subdir" || exit 1; \
+		else \
+			echo "==> $$subdir (not on main yet, nothing to compare against)"; \
+		fi; \
+	done
 
 # --- all modules ------------------------------------------------------------
 

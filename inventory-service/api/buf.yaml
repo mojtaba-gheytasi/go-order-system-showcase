@@ -1,0 +1,27 @@
+version: v2
+
+# This module is its own buf workspace, and that is deliberate rather than
+# incidental.
+#
+# A single workspace at the repository root would let one service's .proto import
+# another's, and buf would resolve it happily — at which point a change to
+# inventory's contract could break order's generated code, which is exactly the
+# coupling these separate modules exist to prevent. With a workspace per service
+# that import fails to resolve, so the boundary is enforced by the tooling instead
+# of by remembering.
+#
+# It also means this directory is self-contained: extracting the service to its own
+# repository is a copy, with no configuration left behind in somebody else's root.
+modules:
+  - path: proto
+
+# Policy is per service on purpose. These two happen to agree today; a service with
+# different consumers could reasonably choose differently, and would not have to
+# negotiate with anyone to do it.
+lint:
+  use:
+    - STANDARD
+
+breaking:
+  use:
+    - FILE
