@@ -3,6 +3,7 @@
 PROJECT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ORDER_DIR := $(PROJECT_DIR)/order-service
 INVENTORY_DIR := $(PROJECT_DIR)/inventory-service
+NOTIFICATION_DIR := $(PROJECT_DIR)/notification-service
 INVENTORY_API_DIR := $(INVENTORY_DIR)/api
 ORDER_API_DIR := $(ORDER_DIR)/api
 
@@ -10,6 +11,8 @@ ORDER_ENV := $(ORDER_DIR)/.env
 ORDER_ENV_FILE := $(if $(wildcard $(ORDER_ENV)),$(ORDER_ENV),$(ORDER_DIR)/.env.example)
 INVENTORY_ENV := $(INVENTORY_DIR)/.env
 INVENTORY_ENV_FILE := $(if $(wildcard $(INVENTORY_ENV)),$(INVENTORY_ENV),$(INVENTORY_DIR)/.env.example)
+NOTIFICATION_ENV := $(NOTIFICATION_DIR)/.env
+NOTIFICATION_ENV_FILE := $(if $(wildcard $(NOTIFICATION_ENV)),$(NOTIFICATION_ENV),$(NOTIFICATION_DIR)/.env.example)
 
 COMPOSE := docker compose --project-directory $(PROJECT_DIR) -f $(PROJECT_DIR)/docker-compose.yml
 
@@ -28,18 +31,26 @@ BUF_MODULES := $(sort $(patsubst %/,%,$(dir $(shell find $(PROJECT_DIR) -name bu
 
 -include $(ORDER_ENV)
 -include $(INVENTORY_ENV)
+-include $(NOTIFICATION_ENV)
 
 # Values loaded from the service-local environment files must also be visible to
 # Compose while it interpolates the database configuration.
-export ORDER_ENV_FILE ORDER_DB_NAME ORDER_DB_USER ORDER_DB_PASSWORD ORDER_DB_PORT
+export ORDER_ENV_FILE ORDER_DB_NAME ORDER_DB_USER ORDER_DB_PASSWORD ORDER_DB_PORT \
+	RABBITMQ_USER RABBITMQ_PASSWORD RABBITMQ_PORT RABBITMQ_MANAGEMENT_PORT
 export INVENTORY_ENV_FILE INVENTORY_DB_NAME INVENTORY_DB_USER INVENTORY_DB_PASSWORD \
 	INVENTORY_DB_PORT INVENTORY_GRPC_PORT
+export NOTIFICATION_ENV_FILE NOTIFICATION_DB_NAME NOTIFICATION_DB_USER \
+	NOTIFICATION_DB_PASSWORD NOTIFICATION_DB_PORT
 
 .PHONY: help dev up down stop ps \
 	order-logs order-shell order-db-logs order-db-shell order-db-ready \
 	order-migrate-up order-migrate-down order-migrate-create sqlvet \
 	inventory-logs inventory-shell inventory-db-logs inventory-db-shell inventory-db-ready \
 	inventory-migrate-up inventory-migrate-down inventory-migrate-create inventory-seed \
+	notification-logs notification-shell notification-db-logs notification-db-shell \
+	notification-db-ready notification-migrate-up notification-migrate-down \
+	notification-migrate-create \
+	rabbitmq-logs rabbitmq-ui \
 	proto proto-lint proto-breaking \
 	compose-config modules deps fmt test test-integration vet check
 
@@ -47,10 +58,10 @@ help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-26s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 dev: ## Run the whole system in the foreground
-	$(COMPOSE) up --build order
+	$(COMPOSE) up --build order notification
 
 up: ## Run the whole system in the background
-	$(COMPOSE) up -d --build order
+	$(COMPOSE) up -d --build order notification
 
 down: ## Stop containers while preserving database data
 	$(COMPOSE) down
@@ -120,6 +131,41 @@ inventory-migrate-create: ## Create inventory migration files; usage: make inven
 
 inventory-seed: ## Reapply the development stock seed
 	$(COMPOSE) up --force-recreate inventory-seed
+
+# --- notification-service ---------------------------------------------------
+
+notification-logs: ## Follow notification-service logs
+	$(COMPOSE) logs -f notification
+
+notification-shell: ## Open a shell in the notification-service container
+	$(COMPOSE) exec notification sh
+
+notification-db-logs: ## Follow the notification database logs
+	$(COMPOSE) logs -f notification-postgres
+
+notification-db-shell: ## Open psql in the notification database
+	$(COMPOSE) exec notification-postgres psql -U $(NOTIFICATION_DB_USER) -d $(NOTIFICATION_DB_NAME)
+
+notification-db-ready: ## Check whether the notification database accepts connections
+	$(COMPOSE) exec notification-postgres pg_isready -U $(NOTIFICATION_DB_USER) -d $(NOTIFICATION_DB_NAME)
+
+notification-migrate-up: ## Apply every pending notification database migration
+	migrate -path $(NOTIFICATION_DIR)/migrations -database "$(NOTIFICATION_DATABASE_URL)" up
+
+notification-migrate-down: ## Roll back the latest notification database migration
+	migrate -path $(NOTIFICATION_DIR)/migrations -database "$(NOTIFICATION_DATABASE_URL)" down 1
+
+notification-migrate-create: ## Create notification migration files; usage: make notification-migrate-create name=add_column
+	@test -n "$(name)" || (echo "name is required; usage: make notification-migrate-create name=add_column" && exit 1)
+	migrate create -ext sql -dir $(NOTIFICATION_DIR)/migrations -seq $(name)
+
+# --- messaging --------------------------------------------------------------
+
+rabbitmq-logs: ## Follow the RabbitMQ logs
+	$(COMPOSE) logs -f rabbitmq
+
+rabbitmq-ui: ## Print the RabbitMQ management UI address
+	@echo "http://localhost:$(or $(RABBITMQ_MANAGEMENT_PORT),15672)  user: $(or $(RABBITMQ_USER),orders)"
 
 # --- contracts --------------------------------------------------------------
 

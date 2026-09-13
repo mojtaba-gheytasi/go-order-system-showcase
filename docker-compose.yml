@@ -12,6 +12,7 @@ services:
       GIN_MODE: debug
       DATABASE_URL: postgres://${ORDER_DB_USER:-orders}:${ORDER_DB_PASSWORD:-orders_dev_password}@order-postgres:5432/${ORDER_DB_NAME:-orders}?sslmode=disable
       INVENTORY_GRPC_ADDRESS: inventory:50051
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-orders}:${RABBITMQ_PASSWORD:-orders_dev_password}@rabbitmq:5672/
     depends_on:
       order-postgres:
         condition: service_healthy
@@ -19,6 +20,12 @@ services:
         condition: service_completed_successfully
       inventory:
         condition: service_started
+      # Waiting for a healthy broker here is a convenience for development, not a
+      # requirement: order-service starts and serves without one, and publishing
+      # is best-effort. It means `make up` does not greet you with a warning about
+      # an unreachable broker on the first order.
+      rabbitmq:
+        condition: service_healthy
     ports:
       - "8080:8080"
     volumes:
@@ -129,6 +136,87 @@ services:
       retries: 5
       start_period: 10s
 
+  notification:
+    build:
+      context: .
+      dockerfile: notification-service/Dockerfile
+      target: development
+    working_dir: /workspace/notification-service
+    init: true
+    env_file:
+      - ${NOTIFICATION_ENV_FILE:-./notification-service/.env.example}
+    environment:
+      DATABASE_URL: postgres://${NOTIFICATION_DB_USER:-notifications}:${NOTIFICATION_DB_PASSWORD:-notifications_dev_password}@notification-postgres:5432/${NOTIFICATION_DB_NAME:-notifications}?sslmode=disable
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-orders}:${RABBITMQ_PASSWORD:-orders_dev_password}@rabbitmq:5672/
+    depends_on:
+      notification-postgres:
+        condition: service_healthy
+      notification-migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    # No ports. This service listens on nothing: it consumes from a broker and
+    # writes to a database, and serves no traffic of its own.
+    volumes:
+      - .:/workspace
+
+  notification-migrate:
+    image: migrate/migrate:v4.19.1
+    command:
+      - -path=/migrations/
+      - -database=postgres://${NOTIFICATION_DB_USER:-notifications}:${NOTIFICATION_DB_PASSWORD:-notifications_dev_password}@notification-postgres:5432/${NOTIFICATION_DB_NAME:-notifications}?sslmode=disable
+      - up
+    depends_on:
+      notification-postgres:
+        condition: service_healthy
+    restart: "no"
+    volumes:
+      - ./notification-service/migrations:/migrations:ro
+
+  notification-postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: ${NOTIFICATION_DB_NAME:-notifications}
+      POSTGRES_USER: ${NOTIFICATION_DB_USER:-notifications}
+      POSTGRES_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notifications_dev_password}
+    ports:
+      - "${NOTIFICATION_DB_PORT:-5435}:5432"
+    volumes:
+      - notification-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Pinned to an exact patch version rather than a floating 4-management tag, so
+  # the broker a test ran against is the broker the next machine gets. The queue
+  # arguments this system relies on — quorum queues, at-least-once dead-lettering
+  # — are version-dependent, which makes a moving tag a silent behaviour change.
+  rabbitmq:
+    image: rabbitmq:4.1.4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-orders}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-orders_dev_password}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      # Bound to the loopback interface on purpose. The management UI can read
+      # every queued message, and those messages carry customer email addresses;
+      # publishing that on every interface of a developer's machine is not a
+      # neutral default.
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+
 volumes:
   order-postgres-data:
   inventory-postgres-data:
+  notification-postgres-data:
+  rabbitmq-data:
