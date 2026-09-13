@@ -46,3 +46,52 @@ jobs:
       # already has a working Docker daemon, so no service container is needed.
       - name: Integration tests
         run: make test-integration
+
+  # A separate job because these checks need the full history and a different
+  # toolchain from the Go ones, and because their answer is independent: a
+  # contract can break while the tests still pass.
+  contracts:
+    name: contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # fetch-depth: 0 because `buf breaking` compares against the main branch.
+      # A shallow clone does not contain it, and the check would fail to resolve
+      # its baseline rather than finding nothing wrong.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lint the contracts
+        run: make proto-lint
+
+      # The check that makes producer-owned contracts safe: a change that would
+      # break an existing consumer fails in the pull request that caused it,
+      # rather than at runtime in a service somebody else owns.
+      #
+      # It compares against what is on main, so it is silent about a module main
+      # does not have yet — a newly added contract is unprotected until its first
+      # commit lands, and protected from then on.
+      - name: Check the contracts for breaking changes
+        run: make proto-breaking
+
+      # Generated code is committed, so a .proto edited without regenerating
+      # would ship a contract the generated types do not match.
+      #
+      # The emptiness test is the assertion, not `git status` itself: both
+      # `git status --porcelain` and `git diff --exit-code` exit 0 when the only
+      # difference is an untracked file, so neither notices newly generated
+      # output on its own. This assumes a clean checkout, which is what CI has.
+      - name: Check the generated code is up to date
+        run: |
+          make proto
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::generated code is stale; run 'make proto' and commit the result"
+            git status --porcelain
+            exit 1
+          fi
