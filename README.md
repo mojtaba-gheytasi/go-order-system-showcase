@@ -12,23 +12,29 @@ lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 A client places an order through `POST /orders`. The order service resolves prices
 from a system-owned catalog, saves a `pending` order, reserves stock, then records the
-order as `accepted` or `rejected`. inventory-service is real and is called over gRPC;
-the catalog and notification adapters are still temporary in-process implementations,
-and RabbitMQ and notification-service are deliberately deferred.
+order as `accepted` or `rejected` — and announces the acceptance. notification-service
+picks that announcement up and sends a confirmation. The product catalog is still a
+temporary in-process adapter, and the transactional outbox is deliberately deferred,
+which is what makes the announcement best-effort rather than guaranteed.
 
 ```mermaid
 graph LR
     C[Client] -->|REST| O[order-service]
     O --> P[(PostgreSQL)]
     O -->|gRPC| I[inventory-service]
-    O -->|temporary port adapter| N[notification log]
+    O -->|RabbitMQ| N[notification-service]
+    N --> NP[(PostgreSQL)]
 ```
 
 | Boundary | Responsibility | Current implementation |
 | --- | --- | --- |
-| **order** | Accepts and manages orders | REST API and PostgreSQL repository |
+| **order** | Accepts and manages orders | REST API, PostgreSQL repository, publishes `OrderAccepted` |
 | **inventory** | Tracks and reserves stock | gRPC API |
-| **notification** | Sends notifications | structured-log stub; messaging is planned |
+| **notification** | Sends notifications | consumes `OrderAccepted`, deduplicates, retries, parks |
+
+Both hops are deliberately different. Placing an order needs an answer from inventory
+before it can succeed, so that call is synchronous. Sending a confirmation must never
+fail an order that has already been accepted, so that one is not.
 
 That is the entire feature set, and it is small on purpose: enough surface for the
 problems worth showing — partial failure, contracts between services, consistency
@@ -435,6 +441,128 @@ The design decisions behind all of this, with the alternatives that were rejecte
 
 ---
 
+## How the order event stays compatible
+
+The third boundary is asynchronous: order-service announces that an order was accepted, and
+notification-service reacts. A synchronous call fails in front of you. An event fails much
+later, in another process, against a message that was encoded by a version of the producer
+that may no longer exist — so the interesting problem here is not transport, it is keeping a
+contract readable by consumers that were not updated at the same time.
+
+**Where this currently stands.** The contract exists:
+[`order_accepted.proto`](order-service/api/proto/order/v1/order_accepted.proto), its generated
+types, and the exchange and routing key in
+[`orderevents`](order-service/api/orderevents/topic.go), all checked by `buf lint` and
+`buf breaking` in CI. The publisher and the consumer are the next step, and until they land
+nothing is published.
+
+### The event belongs to order-service
+
+`OrderAccepted` is owned by the service that emits it, because order-service is the authority
+on the fact that an order changed state. Notification is one possible subscriber; analytics or
+fulfilment could subscribe later without a second owner appearing. Consumer ownership has no
+answer to "which of the five owns the schema?"
+
+The opposite rule applies to commands. A notification *platform* owning templates and delivery
+preferences would expose `SendNotification(template_id, recipient, params)` and would own that
+contract, exactly as inventory owns `ReserveStock`. That design was rejected because it makes
+order-service hold a template id and know what belongs in an email — the coupling this boundary
+exists to avoid.
+
+Consequently the concerns split: order owns the event's meaning, schema and routing key;
+notification owns its queues, retries, dead-lettering and deduplication. Full reasoning in
+[ARCHITECTURE.md](ARCHITECTURE.md#who-owns-a-message).
+
+### Why Protobuf
+
+| Format | Best fit | Why not here |
+| --- | --- | --- |
+| **Protobuf** | internal typed services, generated clients, controlled schema evolution | chosen |
+| JSON + JSON Schema | external consumers, webhooks, human readability | no external consumer; loses compile-time types |
+| Avro | Kafka-centric analytics and data lakes, registry-resolved schemas | no Kafka, no analytics consumer, no registry |
+| CloudEvents | a standard envelope *around* a payload | AMQP properties already carry id, type and time |
+
+Both services are Go, the repository already runs protobuf, generated code and buf, and the
+contract can live in the producer's own module. JSON or Avro would trade that away without
+solving a problem this system has. What would change the answer: a consumer outside this
+repository points at JSON Schema; a Kafka analytics pipeline points at Avro.
+
+CloudEvents is not an alternative to Protobuf and is worth not mistaking for one — it
+standardises envelope fields (`id`, `source`, `type`, `time`) around a payload that can itself
+be Protobuf. Here the AMQP basic properties are the envelope, which is enough at three
+services. More event types needing uniform routing, or consumers outside this repository,
+would be the reason to adopt it.
+
+### Protobuf defines the schema, not the delivery
+
+This is the confusion the pairing invites, so it is worth stating flatly: **Protobuf
+describes the shape of a message and how it is serialised. Nothing more.** RabbitMQ moves
+bytes. Delivery guarantees, retry policy and deduplication come from the topology and from the
+consumer, never from the encoding. A perfectly valid Protobuf message can be delivered twice,
+or never.
+
+The guarantee the contract commits to is therefore deliberately modest, and is written into
+the `.proto` itself so no consumer has to infer it:
+
+> **Best-effort publication** from order-service. **At-least-once processing** only after the
+> event has been successfully routed into a queue.
+
+Best-effort, because there is no transactional outbox: publication is not atomic with the
+database commit that caused it. A consumer must never read the absence of an event as proof
+that no order was accepted, and must tolerate seeing the same event twice.
+
+### Why the exchange is topic, not direct
+
+Events go to one **topic** exchange, `orders`. A direct exchange matches a routing key
+by exact equality; a topic exchange matches by pattern. Because the keys are structured
+and versioned, that is what lets a consumer say what it wants:
+
+| Binding | Receives |
+| --- | --- |
+| `order.accepted.v1` | exactly that version — what notification-service uses today |
+| `order.accepted.*` | whichever version is current |
+| `order.#` | every order event, including ones added later |
+
+**The benefit** is that growth needs no coordination. Publishing `order.accepted.v2`
+alongside v1 leaves a v1-only consumer untouched, with no flag and no deploy ordering.
+And a future analytics consumer bound to `order.#` receives a brand-new event type
+without anyone editing it — whereas on a direct exchange, adding an event to
+order-service would mean going into *other services* to add bindings, which is the
+coupling this design spends most of its effort avoiding.
+
+**The downside** is that a wildcard binding can deliver message types the consumer
+cannot decode. That is not theoretical: it is why the consumer validates the `type`
+property on the envelope instead of trusting the routing key it arrived on. The check
+is required *because* of this choice.
+
+**The trade-off, stated plainly:** topic buys nothing today, since notification binds an
+exact key and behaves exactly as it would on a direct exchange. It is bought for the
+second event and the second consumer, and paid for with one validation the consumer
+needs anyway. Direct would have been the simpler, more honest choice if the keys were
+opaque identifiers with no hierarchy — and it *is* what notification-service uses for
+its own private retry and parked exchanges, where nothing will ever subscribe by
+pattern.
+
+### The rules that keep it compatible
+
+- **Never reuse or renumber a field tag.** Deleted numbers and names are `reserved`.
+- **Adding a field is binary-wire-safe — not harmless.** Consumers ignore unknown fields, but
+  messages already sitting in a queue were encoded before the field existed, so anything added
+  to a live version must behave correctly when absent.
+- **A change of meaning is a new version.** `order.accepted.v2` published alongside `v1` until
+  consumers have moved, never an edit to `v1`.
+- **The consumer validates business-required fields**, because proto3 has no `required`. The
+  schema guarantees a field can be decoded, not that it makes sense.
+- **`buf breaking` runs in CI** — with one honest limit: it compares against `main`, so a
+  brand-new contract is unprotected in the commit that adds it.
+- **Routing keys are versioned and immutable.** buf compares schemas and cannot see a changed
+  Go string, so a test pins the literal values; renaming a key silently delivers to nobody.
+
+The last two are the point of the whole section. Producer ownership without mechanical
+compatibility checks just means one team can break another and find out in production.
+
+---
+
 ## Why this exists
 
 Plenty of showcase projects demonstrate that the author can wire libraries together.
@@ -445,8 +573,10 @@ the conditions under which I would decide differently.
 
 **[ARCHITECTURE.md](ARCHITECTURE.md)** answers:
 
-- Where current and planned transport contracts belong, and which service owns them
-- How a service stays testable while depending on Postgres and future remote adapters
+- Where each transport contract belongs, and why an event is owned by its producer
+  while a command is owned by its receiver
+- How a service stays testable while depending on Postgres, a remote gRPC server, and a
+  message broker
 - What happens when a step in the middle of the flow fails
 - What CI enforces, so the document cannot quietly drift away from the code
 
@@ -494,7 +624,8 @@ would be the simpler and more practical production choice.
 | Language | Go | — |
 | Synchronous calls | gRPC + Protocol Buffers | typed contract, generated client, status codes that drive the retry policy |
 | Schema tooling | [buf](https://buf.build) | pinned remote plugins, schema linting, breaking-change detection |
-| Asynchronous messaging | RabbitMQ, planned | intentionally outside the current slice |
+| Event encoding | Protocol Buffers | one contract language for both boundaries; [why, and what would change it](#why-protobuf) |
+| Asynchronous messaging | RabbitMQ | the contract is defined; publisher and consumer are the next step |
 | Storage | PostgreSQL via `pgx` | short transactions around local state only |
 | HTTP | [Gin](https://gin-gonic.com/) on `net/http` | keeps routing, binding, and middleware concise while remaining confined to the inbound adapter |
 | Logging | [zerolog](https://github.com/rs/zerolog) | structured JSON |
@@ -502,7 +633,7 @@ would be the simpler and more practical production choice.
 | Integration tests | `testcontainers-go` | real Postgres started by the repository test |
 | Linting | `golangci-lint` | — |
 | Local environment | Docker Compose | — |
-| CI | GitHub Actions | `go vet`, unit tests, and integration tests over every module on each push; runs the same `make` targets used locally |
+| CI | GitHub Actions | `go vet`, unit tests and integration tests over every module, plus `buf lint`, `buf breaking` and a check that the generated code is current; runs the same `make` targets used locally |
 
 Gin is a deliberate showcase choice, not an application-wide abstraction. Handlers
 translate HTTP into application commands; no Gin type crosses the inbound adapter
@@ -518,7 +649,10 @@ Each is argued for in [ARCHITECTURE.md](ARCHITECTURE.md); the short version:
 
 - Service boundaries drawn around rules and failure modes, not around database tables
 - Each service owns its public API in a separate, dependency-light Go module —
-  `inventory-service/api` depends on exactly two libraries, gRPC and protobuf
+  `inventory-service/api` depends on exactly two libraries, gRPC and protobuf, and
+  `order-service/api` on one, protobuf, because an event needs no client stub
+- Events are owned by their producer, commands by their receiver — opposite rules, because
+  an event has any number of consumers and a command has exactly one
 - One Go module per service, resolved locally with a `replace` directive, so no service
   can reach into another's internals
 - buf pins the code generation, lints the schema, and checks it for breaking changes
@@ -542,8 +676,21 @@ Each is argued for in [ARCHITECTURE.md](ARCHITECTURE.md); the short version:
 - Required request idempotency keys, plus the durable OrderID as inventory's retry key
 - Bounded retry only for transient inventory unavailability
 - Conditional state updates so concurrent requests cannot overwrite each other
-- Transactional outbox, RabbitMQ consumers, and automated recovery are future work,
-  not part of the current implementation
+- The event contract states its own delivery guarantee, so a consumer does not have to
+  infer one: [best-effort publication, at-least-once processing once routed](#protobuf-defines-the-schema-not-the-delivery)
+- Schema compatibility enforced by CI rather than by convention, because producer-owned
+  contracts without a mechanical check just relocate the breakage
+- A publisher confirm is not proof of delivery: `mandatory` plus return handling
+  separates routed, known-not-routed, and genuinely unknown
+- Consumers deduplicate the *effect*, not the message, with an atomic claim and a
+  fencing token — and the retry budget lives beside the effect rather than in the
+  transport's own counter
+- Three attempts then park, with the parked copy confirmed before the original is
+  acknowledged
+- Consumers are built from `Subscription` values, so a second event costs one file and
+  one line rather than a second copy of the transport
+- Transactional outbox, automated recovery, and parked-queue alerting are not part of
+  the current implementation
 
 **Holding stock under contention**
 
@@ -626,6 +773,11 @@ order-service/
   .air.toml                          development hot reload
   cmd/order/main.go                  minimal process entry point
   migrations/                        versioned order database migrations
+  api/                               the public event contract, its own Go module
+    go.mod                           protobuf only — an event has no client stub
+    proto/order/v1/order_accepted.proto
+    gen/order/v1/                    committed generated code
+    orderevents/                     exchange, routing key, content type
   internal/order/
     domain/                          aggregates and business rules
     application/                     use cases and ports
@@ -634,12 +786,13 @@ order-service/
         httpgin/                     inbound REST adapter
       outbound/
         catalogstub/                 temporary system-owned prices
-        inventorystub/               temporary idempotent reservations
-        notificationlog/             temporary notification adapter
+        inventorygrpc/               inventory client, the real reservation call
+        ordereventamqp/              publishes OrderAccepted to RabbitMQ
         postgres/                    outbound persistence adapter
-    wiring/                           builds the order module
+    wiring/                          builds the order module
   internal/bootstrap/                builds and runs the process
-  internal/platform/                 config, database, observability, HTTP lifecycle
+  internal/platform/                 config, correlation, database, observability,
+                                     HTTP lifecycle, RabbitMQ publisher
   go.mod
 
 inventory-service/
@@ -648,6 +801,7 @@ inventory-service/
     proto/inventory/v1/service.proto
     gen/inventory/v1/                committed generated code
   migrations/                        versioned inventory database migrations
+  seed/                              development stock, applied only by Compose
   internal/inventory/
     application/                     use cases, ports, canonicalisation
     adapter/
@@ -655,13 +809,25 @@ inventory-service/
       outbound/postgres/             stock and reservations
     wiring/                          builds the inventory module
   internal/bootstrap/                builds and runs the process
-  internal/platform/                 config, database, observability, gRPC lifecycle
+  internal/platform/                 config, correlation, database, observability, gRPC lifecycle
   go.mod
 
-notification-service/                not yet implemented
+notification-service/                no api module — it publishes nothing
+  migrations/                        versioned notification database migrations
+  internal/notification/
+    application/                     the use case, ports, and outcome taxonomy
+    adapter/
+      inbound/amqpapi/               consumer, topology, retry and parking;
+                                     one Subscription per consumed event
+      outbound/postgres/             the fenced claim on a notification effect
+      outbound/emaillog/             stand-in email provider
+    wiring/                          builds the notification module
+  internal/bootstrap/                builds and runs the process
+  internal/platform/                 config, correlation, database, observability
+  go.mod
 
-buf.yaml, buf.gen.yaml     proto lint, breaking-change rules, pinned generation
-deploy/inventory/          development stock seed, applied by Compose
+(no buf files at the root — each contract module carries its own
+ buf.yaml and buf.gen.yaml, so one service's proto cannot import another's)
 docker-compose.yml         local services and infrastructure
 Makefile                   developer entry points
 Architecture.md            the decisions, and why
@@ -675,13 +841,25 @@ Architecture.md            the decisions, and why
 git clone <repo> && cd go-order-system-showcase
 cp order-service/.env.example order-service/.env
 cp inventory-service/.env.example inventory-service/.env
-make help              # show every available command
-make dev               # the whole system, foreground with hot reload
-make up                # same stack, detached
-make order-logs        # follow order-service logs
-make inventory-logs    # follow inventory-service logs
-make order-db-shell    # open psql in the order database
+cp notification-service/.env.example notification-service/.env
+make help               # show every available command
+make dev                # the whole system, foreground with hot reload
+make up                 # same stack, detached
+make order-logs         # follow order-service logs
+make inventory-logs     # follow inventory-service logs
+make notification-logs  # follow notification-service logs
+make order-db-shell     # open psql in the order database
+make rabbitmq-ui        # print the management UI address and user
 ```
+
+`make up` starts all three services, their three databases, the migrations, the
+development stock seed, and RabbitMQ. Placing an order should produce a `201`, an
+`order confirmation email sent` line in the notification logs, and nothing on the parked
+queue.
+
+The RabbitMQ management UI is bound to `127.0.0.1` rather than every interface, on
+purpose: it can read every queued message, and those messages carry customer email
+addresses.
 
 The service-local `.env` configures both the order application and its local
 Compose/Make resources. The file is ignored by Git; `.env.example` documents every
@@ -703,7 +881,7 @@ make sqlvet
 and the development stock seed. notification-service is not yet implemented.
 
 Regenerating the gRPC contract needs only buf — the plugin versions are pinned in
-`buf.gen.yaml`, so nothing else has to be installed:
+each service's `buf.gen.yaml`, so nothing else has to be installed:
 
 ```bash
 brew install bufbuild/buf/buf
@@ -716,11 +894,24 @@ make proto-breaking  # compares against main
 
 ## Status
 
-`POST /orders` is implemented end to end: order-service persists to PostgreSQL and
-reserves stock from a real inventory-service over gRPC. Catalog and notification are
-still temporary in-process adapters.
+`POST /orders` is implemented end to end across all three services: order-service
+persists to PostgreSQL, reserves stock from inventory-service over gRPC, publishes
+`OrderAccepted` to RabbitMQ, and notification-service consumes it, deduplicates the
+effect, and sends a confirmation — retrying a failing provider three times before
+parking the message. The product catalog is still a temporary in-process adapter.
 
-Deliberately out of scope: payment, OpenAPI, RabbitMQ, the transactional outbox,
-reservation expiry and release, automated pending-order recovery, and request
-fingerprinting. A reservation is permanent, so an order that fails after its stock is
-held keeps that stock — `reservations` records which products, so it can be seen.
+**What this is not.** The asynchronous hop is not production-reliable, and the reason is
+one missing piece: there is no transactional outbox, so publishing is not atomic with
+the commit that causes it. Publication is therefore best-effort — an accepted order
+whose publish fails sends no email, and a confirmation that times out leaves the outcome
+genuinely unknown. Consumer deduplication is best-effort for a related reason: the
+window between a provider accepting an email and the record being written cannot be
+closed without provider-side idempotency. Both are stated precisely in
+[ARCHITECTURE.md](ARCHITECTURE.md#what-publishing-the-event-actually-guarantees) rather
+than rounded up.
+
+Deliberately out of scope: payment, OpenAPI, the transactional outbox, reservation
+expiry and release, automated pending-order recovery, request fingerprinting, a real
+email provider, and alerting on the parked queue. A reservation is permanent, so an
+order that fails after its stock is held keeps that stock — `reservations` records which
+products, so it can be seen.
