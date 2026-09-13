@@ -1,0 +1,13 @@
+version: v2
+
+# Generation template for order-service/api. See buf.gen.inventory.yaml for why
+# there is one template per module rather than one for the workspace.
+#
+# No gRPC plugin here: order-service's contract is events, not methods. That is
+# what keeps this module's dependency list to protobuf alone, so consuming
+# order's events does not drag a gRPC runtime into a consumer that only reads
+# messages off a queue.
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.10
+    out: gen
+    opt: paths=source_relative
