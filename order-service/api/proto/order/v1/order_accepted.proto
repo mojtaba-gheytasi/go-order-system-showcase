@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package order.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/api/gen/order/v1;orderv1";
+
+// OrderAccepted announces that an order reached the accepted state.
+//
+// Published once by order-service to the "orders" topic exchange with routing key
+// "order.accepted.v1", immediately after the transition from pending to accepted was
+// committed. Both names are constants in this module's orderevents package.
+//
+// NAME. The accepted order state was durably committed before this event was published.
+// That is a statement about the order, not the event: the event itself can still be
+// lost. An order is created as pending well before this point.
+//
+// DELIVERY. Best-effort publication; at-least-once processing only after the event has
+// been routed into a queue. There is no transactional outbox, so publication is not
+// atomic with the state change: a publish can be refused as unroutable, succeed, or end
+// with an unknown outcome when a confirm times out. Nothing reconciles or republishes
+// it. Never read the absence of an event as proof that no order was accepted, and
+// tolerate receiving the same event twice.
+//
+// COMPATIBILITY. Field numbers are never reused or renumbered; deletions are reserved.
+// Adding a field is binary-wire-safe, which is not the same as harmless: ignore fields
+// you do not know, and anything added to v1 must behave correctly when absent, because
+// events already queued were encoded without it. A change to what an existing field
+// means is a new version, never an edit to this one.
+message OrderAccepted {
+  // Sent as the AMQP message_id.
+  //
+  // Deliberately not the deduplication key for sending an email: two events could
+  // describe the same effect. What must not repeat is the effect — one confirmation per
+  // order, kind and channel — which is the consumer's own business.
+  string event_id = 1;
+
+  string order_id = 2;
+
+  // Audit data, NOT an ordering guarantee: two events cannot be reliably ordered by
+  // comparing it. Ordering would need an aggregate sequence number, which is a contract
+  // change rather than a new reading of this field.
+  google.protobuf.Timestamp occurred_at = 3;
+
+  string customer_email = 4;
+
+  // Deliberately not a payment status: payment is outside this system.
+  Money total_amount = 5;
+
+  // Order is not meaningful; do not depend on the sequence.
+  repeated OrderLine lines = 6;
+}
+
+// An exact amount in a currency's minor unit — 1250 is 12.50 EUR. Integer minor units
+// because money that is added and compared cannot afford binary rounding. Signed, so a
+// later credit or refund needs no wire change.
+message Money {
+  int64 amount_in_minor_units = 1;
+  // ISO 4217, uppercase.
+  string currency = 2;
+}
+
+// Prices are captured when the order was placed, not whatever the catalogue says now:
+// an accepted order is an immutable snapshot, prices included.
+message OrderLine {
+  string product_sku = 1;
+  // Always greater than zero. proto3 cannot express that, so the consumer validates it.
+  int32 quantity = 2;
+  // For a single unit, not the line total.
+  Money unit_price = 3;
+}

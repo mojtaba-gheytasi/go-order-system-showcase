@@ -14,24 +14,21 @@ import (
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/inbound/httpgin"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/catalogstub"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/inventorygrpc"
-	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/notificationlog"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/ordereventamqp"
 	orderpostgres "github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/postgres"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
 )
 
 type Dependencies struct {
-	DB     *sql.DB
-	Logger zerolog.Logger
-	Clock  func() time.Time
-	NewID  func() string
-
-	// InventoryConn is owned by the caller, which is also responsible for
-	// closing it.
+	DB               *sql.DB
+	Logger           zerolog.Logger
+	Clock            func() time.Time
+	NewID            func() string
 	InventoryConn    *grpc.ClientConn
 	InventoryTimeout time.Duration
+	EventPublisher   ordereventamqp.MessagePublisher
 }
 
-// Module is what the order context contributes to the process.
 type Module struct {
 	HTTPHandler http.Handler
 }
@@ -51,7 +48,7 @@ func New(dependencies Dependencies) (*Module, error) {
 		orderpostgres.NewOrderRepository(dependencies.DB),
 		catalogstub.New(),
 		inventory,
-		notificationlog.NewNotifier(dependencies.Logger),
+		ordereventamqp.NewPublisher(dependencies.EventPublisher),
 		now,
 		newID,
 		dependencies.Logger,

@@ -1,0 +1,21 @@
+version: v2
+
+# Generation template for inventory-service/api.
+#
+# There is one template per contract module rather than one for the workspace.
+# `paths=source_relative` strips each module's root from the output path, so two
+# modules generating in a single run would both write into the same `out`
+# directory and collide. `make proto` therefore runs buf once per module, each
+# with its own template and its own input.
+#
+# Remote plugins, so generating the code needs only buf — no protoc-gen-go or
+# protoc-gen-go-grpc installed locally, and every machine produces byte-identical
+# output because the plugin versions are pinned here.
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.10
+    out: gen
+    opt: paths=source_relative
+
+  - remote: buf.build/grpc/go:v1.5.1
+    out: gen
+    opt: paths=source_relative

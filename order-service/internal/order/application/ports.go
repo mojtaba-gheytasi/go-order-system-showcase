@@ -33,8 +33,11 @@ type InventoryReserver interface {
 	Reserve(ctx context.Context, request ReservationRequest) error
 }
 
-type OrderNotifier interface {
-	NotifyOrderCreated(ctx context.Context, order *domain.Order) error
+// OrderEventPublisher announces facts about orders. It is deliberately not
+// called a notifier: this service does not know that anything sends email, and
+// naming the port after one of its subscribers would put that knowledge back.
+type OrderEventPublisher interface {
+	PublishOrderAccepted(ctx context.Context, event OrderAcceptedEvent) error
 }
 
 type Clock func() time.Time
