@@ -16,19 +16,22 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/api/orderevents"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/inventorygrpc"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/wiring"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/config"
 	platformdatabase "github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/database"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/httpserver"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/rabbitmq"
 )
 
 type App struct {
-	logger        zerolog.Logger
-	address       string
-	db            *sql.DB
-	inventoryConn *grpc.ClientConn
-	server        *httpserver.Server
+	logger         zerolog.Logger
+	address        string
+	db             *sql.DB
+	inventoryConn  *grpc.ClientConn
+	eventPublisher *rabbitmq.Publisher
+	server         *httpserver.Server
 }
 
 func New(
@@ -64,6 +67,30 @@ func New(
 		return nil, fmt.Errorf("create inventory client: %w", err)
 	}
 
+	// Like the gRPC client above, this does not connect here. It dials on its
+	// first publication and redials after a failure, so a broker that is down
+	// delays nothing at startup and fails only the announcements themselves —
+	// which are best-effort by design.
+	//
+	// The exchange is declared from the contract's own constants rather than from
+	// configuration. Its name and settings are part of what order-service
+	// publishes, not something an operator should be able to vary per environment.
+	eventPublisher := rabbitmq.NewPublisher(
+		rabbitmq.Config{
+			URL:            applicationConfig.RabbitMQURL,
+			PublishTimeout: applicationConfig.RabbitMQPublishTimeout,
+			ReconnectDelay: applicationConfig.RabbitMQReconnectDelay,
+			Exchanges: []rabbitmq.ExchangeDeclaration{{
+				Name:       orderevents.ExchangeOrders,
+				Kind:       orderevents.ExchangeOrdersKind,
+				Durable:    orderevents.ExchangeOrdersDurable,
+				AutoDelete: orderevents.ExchangeOrdersAutoDelete,
+				Internal:   orderevents.ExchangeOrdersInternal,
+			}},
+		},
+		logger,
+	)
+
 	orderModule, err := wiring.New(wiring.Dependencies{
 		DB:               db,
 		Logger:           logger,
@@ -71,9 +98,11 @@ func New(
 		NewID:            newIDGenerator(logger),
 		InventoryConn:    inventoryConn,
 		InventoryTimeout: applicationConfig.InventoryGRPCTimeout,
+		EventPublisher:   eventPublisher,
 	})
 	if err != nil {
 		// No App is returned, so nobody will close these.
+		_ = eventPublisher.Close()
 		_ = inventoryConn.Close()
 		_ = db.Close()
 
@@ -81,10 +110,11 @@ func New(
 	}
 
 	return &App{
-		logger:        logger,
-		address:       applicationConfig.HTTPServerAddress,
-		db:            db,
-		inventoryConn: inventoryConn,
+		logger:         logger,
+		address:        applicationConfig.HTTPServerAddress,
+		db:             db,
+		inventoryConn:  inventoryConn,
+		eventPublisher: eventPublisher,
 		server: httpserver.NewServer(
 			httpserver.Config{
 				Address:           applicationConfig.HTTPServerAddress,
@@ -123,11 +153,15 @@ func (app *App) Shutdown(ctx context.Context) error {
 	return app.server.Shutdown(ctx)
 }
 
-// CloseDB releases the resources New acquired. Call it after Shutdown, so that
+// Close releases the resources New acquired. Call it after Shutdown, so that
 // requests still draining can finish the calls they are in the middle of.
 //
-// errors.Join rather than an early return: a failure closing the inventory
-// connection must not leave the database pool open.
-func (app *App) CloseDB() error {
-	return errors.Join(app.inventoryConn.Close(), app.db.Close())
+// errors.Join rather than an early return: a failure closing any one of these
+// must not leave the others open.
+func (app *App) Close() error {
+	return errors.Join(
+		app.eventPublisher.Close(),
+		app.inventoryConn.Close(),
+		app.db.Close(),
+	)
 }

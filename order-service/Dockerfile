@@ -18,10 +18,13 @@ RUN GOBIN=/usr/local/bin go install github.com/air-verse/air@${AIR_VERSION} && \
     adduser -D -u 1000 -G developer developer && \
     chown -R developer:developer /go /workspace
 
-# inventory-service/api is a separate module reached through a replace
-# directive, so it has to be present before `go mod download` can resolve it.
+# Both api modules are reached through replace directives, so they have to be
+# present before `go mod download` can resolve them. order-service/api arrives
+# again with the full source copy below; it is copied here because a replace
+# target missing at download time fails the build.
 COPY order-service/go.mod order-service/go.sum ./
 COPY inventory-service/api/ /workspace/inventory-service/api/
+COPY order-service/api/ ./api/
 RUN go mod download && \
     chown -R developer:developer /go
 
@@ -44,9 +47,11 @@ ARG TARGETARCH
 # These files are copied into the minimal runtime image below.
 RUN apk add --no-cache ca-certificates tzdata
 
-# Keep dependency download in its own cached layer.
+# Keep dependency download in its own cached layer. Both replace targets have to
+# exist before the download, for the same reason as in the development stage.
 COPY order-service/go.mod order-service/go.sum ./
 COPY inventory-service/api/ /workspace/inventory-service/api/
+COPY order-service/api/ ./api/
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 

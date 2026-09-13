@@ -38,7 +38,7 @@ type CreateOrder struct {
 	orders    OrderRepository
 	catalog   ProductCatalog
 	inventory InventoryReserver
-	notifier  OrderNotifier
+	events    OrderEventPublisher
 	clock     Clock
 	newID     IDGenerator
 	logger    zerolog.Logger
@@ -48,7 +48,7 @@ func NewCreateOrder(
 	orders OrderRepository,
 	catalog ProductCatalog,
 	inventory InventoryReserver,
-	notifier OrderNotifier,
+	events OrderEventPublisher,
 	clock Clock,
 	newID IDGenerator,
 	logger zerolog.Logger,
@@ -57,7 +57,7 @@ func NewCreateOrder(
 		orders:    orders,
 		catalog:   catalog,
 		inventory: inventory,
-		notifier:  notifier,
+		events:    events,
 		clock:     clock,
 		newID:     newID,
 		logger:    logger,
@@ -149,7 +149,7 @@ func (useCase *CreateOrder) processPending(
 		return CreateOrderResult{}, fmt.Errorf("persist accepted order: %w", err)
 	}
 
-	useCase.notify(ctx, order)
+	useCase.publish(ctx, order)
 
 	return CreateOrderResult{Order: order, Created: created}, nil
 }
@@ -321,11 +321,25 @@ func productSKUs(items []CreateOrderItem) []string {
 	return productSKUs
 }
 
-func (useCase *CreateOrder) notify(ctx context.Context, order *domain.Order) {
-	if err := useCase.notifier.NotifyOrderCreated(ctx, order); err != nil {
+// publish announces the acceptance, and swallows any failure.
+//
+// The order is already durably accepted at this point. Turning a publication
+// failure into an API error would tell the client its order failed when it did
+// not, inviting a retry that cannot help — the retry finds the order accepted and
+// publishes nothing, because only the request that stores the acceptance
+// publishes. There is no outbox, so a lost event stays lost and this log line is
+// the only record of it.
+//
+// The snapshot is taken here rather than inside the adapter so that the event's
+// identity and timestamp are decided once, by the layer that owns the fact.
+func (useCase *CreateOrder) publish(ctx context.Context, order *domain.Order) {
+	event := newOrderAcceptedEvent(useCase.newID(), order)
+
+	if err := useCase.events.PublishOrderAccepted(ctx, event); err != nil {
 		useCase.logger.Warn().
 			Err(err).
 			Str("order_id", string(order.ID())).
-			Msg("failed to notify accepted order")
+			Str("event_id", event.EventID).
+			Msg("order accepted but its event was not published")
 	}
 }

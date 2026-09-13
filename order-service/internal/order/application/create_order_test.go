@@ -22,7 +22,7 @@ var (
 	testIdempotencyKey = "create-order-1"
 )
 
-func TestCreateOrderPersistsPendingBeforeInventoryThenAcceptsAndNotifies(t *testing.T) {
+func TestCreateOrderPersistsPendingBeforeInventoryThenAcceptsAndPublishes(t *testing.T) {
 	dependencies := newDependencies()
 
 	result, err := dependencies.useCase().Execute(context.Background(), testCommand())
@@ -39,14 +39,14 @@ func TestCreateOrderPersistsPendingBeforeInventoryThenAcceptsAndNotifies(t *test
 	assert.Equal(t, domain.StatusPending, dependencies.repository.expectedStatus)
 	assert.Equal(t, 1, dependencies.repository.createCalls)
 	assert.Equal(t, 1, dependencies.repository.updateCalls)
-	assert.Equal(t, 1, dependencies.notifier.calls)
+	assert.Equal(t, 1, dependencies.events.calls)
 
 	created := dependencies.trace.index("create")
 	reserved := dependencies.trace.index("reserve")
 	require.NotEqual(t, -1, created)
 	require.NotEqual(t, -1, reserved)
 	assert.Less(t, created, reserved, "pending must be persisted before inventory is called")
-	assert.Less(t, dependencies.trace.index("update"), dependencies.trace.index("notify"))
+	assert.Less(t, dependencies.trace.index("update"), dependencies.trace.index("publish"))
 
 	require.Len(t, dependencies.reserver.requests, 1)
 	request := dependencies.reserver.requests[0]
@@ -86,7 +86,7 @@ func TestCreateOrderReturnsAcceptedReplayWithoutExternalCalls(t *testing.T) {
 	assert.Equal(t, 0, dependencies.reserver.calls)
 	assert.Equal(t, 0, dependencies.repository.createCalls)
 	assert.Equal(t, 0, dependencies.repository.updateCalls)
-	assert.Equal(t, 0, dependencies.notifier.calls)
+	assert.Equal(t, 0, dependencies.events.calls)
 }
 
 func TestCreateOrderReturnsRejectedReplayWithoutExternalCalls(t *testing.T) {
@@ -103,7 +103,7 @@ func TestCreateOrderReturnsRejectedReplayWithoutExternalCalls(t *testing.T) {
 	assert.Equal(t, 0, dependencies.catalog.calls)
 	assert.Equal(t, 0, dependencies.reserver.calls)
 	assert.Equal(t, 0, dependencies.repository.updateCalls)
-	assert.Equal(t, 0, dependencies.notifier.calls)
+	assert.Equal(t, 0, dependencies.events.calls)
 }
 
 func TestCreateOrderPendingReplayUsesPersistedOrderSnapshot(t *testing.T) {
@@ -197,7 +197,7 @@ func TestCreateOrderStopsAfterThreeUnavailableInventoryAttemptsAndLeavesPending(
 	assert.Equal(t, 3, dependencies.reserver.calls)
 	assert.Equal(t, domain.StatusPending, dependencies.repository.statusAtCreate)
 	assert.Equal(t, 0, dependencies.repository.updateCalls)
-	assert.Equal(t, 0, dependencies.notifier.calls)
+	assert.Equal(t, 0, dependencies.events.calls)
 }
 
 func TestCreateOrderDoesNotRetryInsufficientStockAndPersistsRejected(t *testing.T) {
@@ -211,7 +211,7 @@ func TestCreateOrderDoesNotRetryInsufficientStockAndPersistsRejected(t *testing.
 	assert.Equal(t, 1, dependencies.repository.updateCalls)
 	assert.Equal(t, domain.StatusRejected, dependencies.repository.statusAtUpdate)
 	assert.Equal(t, domain.StatusPending, dependencies.repository.expectedStatus)
-	assert.Equal(t, 0, dependencies.notifier.calls)
+	assert.Equal(t, 0, dependencies.events.calls)
 }
 
 // The order is stored as rejected either way, but what inventory said about the
@@ -290,7 +290,7 @@ func TestCreateOrderAttemptsStatePersistenceOnlyOnce(t *testing.T) {
 			_, err := dependencies.useCase().Execute(context.Background(), testCommand())
 			require.ErrorIs(t, err, databaseError)
 			assert.Equal(t, 1, dependencies.repository.updateCalls)
-			assert.Equal(t, 0, dependencies.notifier.calls)
+			assert.Equal(t, 0, dependencies.events.calls)
 		})
 	}
 }
@@ -311,7 +311,7 @@ func TestCreateOrderReloadsTheWinningStateAfterAConflict(t *testing.T) {
 	assert.Same(t, winner, result.Order)
 	assert.Equal(t, 1, dependencies.repository.updateCalls)
 	assert.Equal(t, 1, dependencies.repository.findByIDCalls)
-	assert.Equal(t, 0, dependencies.notifier.calls, "only the request that stores acceptance notifies")
+	assert.Equal(t, 0, dependencies.events.calls, "only the request that stores acceptance publishes")
 }
 
 func TestCreateOrderPropagatesCatalogFailures(t *testing.T) {
@@ -372,19 +372,19 @@ func TestCreateOrderDoesNotCallInventoryWhenInitialPersistenceFails(t *testing.T
 
 	require.ErrorIs(t, err, failure)
 	assert.Equal(t, 0, dependencies.reserver.calls)
-	assert.Equal(t, 0, dependencies.notifier.calls)
+	assert.Equal(t, 0, dependencies.events.calls)
 }
 
-func TestCreateOrderSucceedsWhenNotificationFails(t *testing.T) {
+func TestCreateOrderSucceedsWhenPublicationFails(t *testing.T) {
 	dependencies := newDependencies()
-	dependencies.notifier.err = errors.New("notification unavailable")
+	dependencies.events.err = errors.New("broker unavailable")
 
 	result, err := dependencies.useCase().Execute(context.Background(), testCommand())
 
 	require.NoError(t, err)
 	assert.True(t, result.Created)
 	assert.Equal(t, domain.StatusAccepted, result.Order.Status())
-	assert.Equal(t, 1, dependencies.notifier.calls)
+	assert.Equal(t, 1, dependencies.events.calls)
 }
 
 func TestCreateOrderRejectsAnInvalidCommandBeforePersistence(t *testing.T) {
@@ -471,7 +471,7 @@ type dependencies struct {
 	repository *fakeRepository
 	catalog    *fakeCatalog
 	reserver   *fakeReserver
-	notifier   *fakeNotifier
+	events     *fakeEventPublisher
 	trace      *callTrace
 }
 
@@ -485,7 +485,7 @@ func newDependencies() *dependencies {
 			"SKU-B": {AmountInCents: 500, Currency: "EUR"},
 		}},
 		reserver: &fakeReserver{trace: trace},
-		notifier: &fakeNotifier{trace: trace},
+		events:   &fakeEventPublisher{trace: trace},
 		trace:    trace,
 	}
 }
@@ -495,7 +495,7 @@ func (d *dependencies) useCase() *application.CreateOrder {
 		d.repository,
 		d.catalog,
 		d.reserver,
-		d.notifier,
+		d.events,
 		func() time.Time { return fixedNow },
 		func() string { return generatedID },
 		zerolog.New(io.Discard),
@@ -624,17 +624,25 @@ func (reserver *fakeReserver) Reserve(
 	return nil
 }
 
-type fakeNotifier struct {
+type fakeEventPublisher struct {
 	trace *callTrace
 	err   error
 	calls int
+
+	// published keeps what was announced, not merely that something was. The
+	// event is a published contract, so its contents are worth asserting on.
+	published []application.OrderAcceptedEvent
 }
 
-var _ application.OrderNotifier = (*fakeNotifier)(nil)
+var _ application.OrderEventPublisher = (*fakeEventPublisher)(nil)
 
-func (notifier *fakeNotifier) NotifyOrderCreated(context.Context, *domain.Order) error {
-	notifier.trace.record("notify")
-	notifier.calls++
+func (publisher *fakeEventPublisher) PublishOrderAccepted(
+	_ context.Context,
+	event application.OrderAcceptedEvent,
+) error {
+	publisher.trace.record("publish")
+	publisher.calls++
+	publisher.published = append(publisher.published, event)
 
-	return notifier.err
+	return publisher.err
 }

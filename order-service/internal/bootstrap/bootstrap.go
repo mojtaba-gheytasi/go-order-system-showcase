@@ -47,7 +47,7 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	defer func() {
-		_ = app.CloseDB()
+		_ = app.Close()
 	}()
 
 	serverFailed := make(chan error, 1)

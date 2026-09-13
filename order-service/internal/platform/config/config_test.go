@@ -27,6 +27,9 @@ LOG_LEVEL=info
 LOG_CALLER=false
 INVENTORY_GRPC_ADDRESS=inventory:50051
 INVENTORY_GRPC_TIMEOUT=3s
+RABBITMQ_URL=amqp://orders:secret@rabbitmq:5672/
+RABBITMQ_PUBLISH_TIMEOUT=2s
+RABBITMQ_RECONNECT_DELAY=5s
 `
 
 func TestLoadReadsOptionalLocalEnvironmentFile(t *testing.T) {
@@ -50,6 +53,10 @@ func TestLoadReadsOptionalLocalEnvironmentFile(t *testing.T) {
 	require.NotNil(t, loaded.LogCaller)
 	assert.False(t, *loaded.LogCaller)
 	assert.Equal(t, "inventory:50051", loaded.InventoryGRPCAddress)
+	assert.Equal(t, 3*time.Second, loaded.InventoryGRPCTimeout)
+	assert.Equal(t, "amqp://orders:secret@rabbitmq:5672/", loaded.RabbitMQURL)
+	assert.Equal(t, 2*time.Second, loaded.RabbitMQPublishTimeout)
+	assert.Equal(t, 5*time.Second, loaded.RabbitMQReconnectDelay)
 }
 
 func TestLoadAllowsEnvironmentToOverrideConfigFile(t *testing.T) {
@@ -106,6 +113,9 @@ LOG_LEVEL=info
 LOG_CALLER=false
 INVENTORY_GRPC_ADDRESS=inventory:50051
 INVENTORY_GRPC_TIMEOUT=3s
+RABBITMQ_URL=amqp://orders:secret@rabbitmq:5672/
+RABBITMQ_PUBLISH_TIMEOUT=2s
+RABBITMQ_RECONNECT_DELAY=5s
 `)
 
 	_, err := config.Load(directory)
@@ -130,6 +140,9 @@ LOG_LEVEL=verbose
 LOG_CALLER=false
 INVENTORY_GRPC_ADDRESS=inventory:50051
 INVENTORY_GRPC_TIMEOUT=3s
+RABBITMQ_URL=amqp://orders:secret@rabbitmq:5672/
+RABBITMQ_PUBLISH_TIMEOUT=2s
+RABBITMQ_RECONNECT_DELAY=5s
 `)
 
 	_, err := config.Load(directory)
