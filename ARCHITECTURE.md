@@ -52,45 +52,8 @@ on everything below.
 
 ## Why these three services
 
-The split follows one rule: **things that change for different reasons, and break in
-different ways, live apart.**
-
-| Service | The rule it protects | Why it is on its own |
-| --- | --- | --- |
-| **order** | An order cannot be accepted without reserved stock, and cannot be cancelled once shipped | Owns the order lifecycle. Changes when order rules change. |
-| **inventory** | Available stock never drops below zero | Its hard problem is contention — many orders competing for the same rows at once. A completely different concurrency profile from order. |
-| **notification** | none | It has no business rule at all. It is separate because it *fails* differently: email providers are slow and unreliable, and that must never stop someone placing an order. |
-
-The clearest sign that these are real boundaries is the word "order" itself. In
-order-service it is a lifecycle with states and rules. In inventory it is just an ID
-attached to a reservation. In notification it is a few fields in an email template.
-One word, three meanings — that is where a boundary belongs.
-
-**Being honest about it.** At this volume, a single service with three packages would
-work fine and would be less work to run. The split is here to demonstrate service
-boundaries. What makes it defensible rather than decorative is that the lines follow
-the rules above — each service could be scaled, deployed, and rewritten on its own.
-
-**What would tell me the boundary is wrong.** If order and inventory always changed in
-the same pull request and always deployed together, they would be one service
-pretending to be two.
-
----
-
-## Why one repository
-
-All three services live in a single repository.
-
-**It is a showcase.** A reader opens one repository and sees the whole system — how
-the services are split, how they talk, and how the pieces fit.
-
-**When I would decide differently.** Separate repositories pay off when separate teams
-need to release on their own schedule — several teams owning services independently,
-services written in different languages, or genuinely different release cadences. Then
-separate repositories, and a schema registry such as Buf's BSR, start to pay for
-themselves. None of that holds here: for around five backend developers, ten
-repositories for ten services means ten CI pipelines, ten sets of dependency updates,
-and ten places to change when something shared moves. Real cost, no benefit.
+I have identified three logical boundaries: order, inventory, and notification. For this showcase, I deliberately map them to three independently deployable services so I can demonstrate how I approach distributed-system concerns such as partial failures, cross-service consistency, retries, idempotency, and asynchronous communication.
+This is not a claim that these logical boundaries inherently justify three physical services. In a real project, I would likely begin with a single deployable application while preserving these boundaries as separate modules. I would extract a module into its own service only when there is clear evidence for doing so
 
 ---
 
