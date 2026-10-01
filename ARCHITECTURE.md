@@ -5,7 +5,6 @@ Decisions are recorded here as they are made, so everything is in one place.
 
 - [The system](#the-system)
 - [Why these three services](#why-these-three-services)
-- [Why one repository](#why-one-repository)
 - [How services share contracts](#how-services-share-contracts)
 - [Inside a service: staying testable](#inside-a-service-staying-testable)
 - [What happens when things fail halfway](#what-happens-when-things-fail-halfway)
