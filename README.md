@@ -17,15 +17,6 @@ picks that announcement up and sends a confirmation. The product catalog is stil
 temporary in-process adapter, and the transactional outbox is deliberately deferred,
 which is what makes the announcement best-effort rather than guaranteed.
 
-```mermaid
-graph LR
-    C[Client] -->|REST| O[order-service]
-    O --> P[(PostgreSQL)]
-    O -->|gRPC| I[inventory-service]
-    O -->|RabbitMQ| N[notification-service]
-    N --> NP[(PostgreSQL)]
-```
-
 | Boundary | Responsibility | Current implementation |
 | --- | --- | --- |
 | **order** | Accepts and manages orders | REST API, PostgreSQL repository, publishes `OrderAccepted` |
@@ -614,30 +605,6 @@ service-owned data, idempotency, partial-failure handling, and eventual consiste
 should not be interpreted as a recommendation to begin every similarly sized
 production system with microservices. For the current feature set, a modular monolith
 would be the simpler and more practical production choice.
-
----
-
-## Stack
-
-| Purpose | Choice | Why |
-| --- | --- | --- |
-| Language | Go | — |
-| Synchronous calls | gRPC + Protocol Buffers | typed contract, generated client, status codes that drive the retry policy |
-| Schema tooling | [buf](https://buf.build) | pinned remote plugins, schema linting, breaking-change detection |
-| Event encoding | Protocol Buffers | one contract language for both boundaries; [why, and what would change it](#why-protobuf) |
-| Asynchronous messaging | RabbitMQ | the contract is defined; publisher and consumer are the next step |
-| Storage | PostgreSQL via `pgx` | short transactions around local state only |
-| HTTP | [Gin](https://gin-gonic.com/) on `net/http` | keeps routing, binding, and middleware concise while remaining confined to the inbound adapter |
-| Logging | [zerolog](https://github.com/rs/zerolog) | structured JSON |
-| Migrations | `golang-migrate` | plain SQL, versioned |
-| Integration tests | `testcontainers-go` | real Postgres started by the repository test |
-| Linting | `golangci-lint` | — |
-| Local environment | Docker Compose | — |
-| CI | GitHub Actions | `go vet`, unit tests and integration tests over every module, plus `buf lint`, `buf breaking` and a check that the generated code is current; runs the same `make` targets used locally |
-
-Gin is a deliberate showcase choice, not an application-wide abstraction. Handlers
-translate HTTP into application commands; no Gin type crosses the inbound adapter
-boundary. Server timeouts and graceful shutdown still use `net/http` directly.
 
 ---
 
