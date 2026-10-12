@@ -1,19 +1,19 @@
 # Go Order System
 
-[CI](https://github.com/mojtaba-gheytasi/go-order-system-showcase/actions/workflows/ci.yml)
+[![CI](https://github.com/mojtaba-gheytasi/go-order-system-showcase/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mojtaba-gheytasi/go-order-system-showcase/actions/workflows/ci.yml)
 
 A failure-aware order workflow built in Go. The business scope is intentionally narrow;
 the focus is the behavior at distributed-system boundaries: concurrent reservations,
 duplicate requests, lost responses, partial failures, and at-least-once delivery.
 
-> **This is a distributed-systems showcase**, not a recommendation to start a product of
-> this size, with these requirements and constraints, using microservices. Microservices
-> introduce significant complexity, and without a real need, they can create more problems
-> than they solve.
-> In general, I prefer a modular-monolith-first approach. I would start with a
-> modular-monolith and only extract a module into a separate service when there's a clear
-> reason, such as independent scaling, team autonomy, different reliability requirements,
-> or the need for a different programming language or technology.
+**This is a distributed-systems showcase, not a recommendation to start a product of
+this size, with these requirements and constraints, using microservices.** Microservices
+introduce significant complexity, and without a real need, they can create more problems
+than they solve.
+**In general, I prefer a modular-monolith-first approach.** I would start with a
+modular-monolith and only extract a module into a separate service when there's a clear
+reason, such as independent scaling, team autonomy, different reliability requirements,
+or the need for a different programming language or technology.
 
 ## System overview
 
@@ -28,10 +28,14 @@ flowchart LR
     Notification --- NotificationDB[(notifications PostgreSQL)]
 ```
 
-1. Why three services
+#### Why three services
 
-Because it makes **two opposite failure models executable** in one workflow that I want
-to show how I handle in a distrubuted system:
+I have identified three logical boundaries: order, inventory, and notification. For this
+showcase, I deliberately map them to three independently deployable services **to demonstrate
+how I handle partial failures, cross-service consistency, retries, idempotency, and 
+asynchronous communication.**
+
+Together, they make two different failure models concrete in one workflow:
 
 - **Inventory (synchronous)** The order must wait for inventory confirmation before it
 can be accepted.
@@ -44,21 +48,18 @@ belong to the producer (`OrderAccepted` belongs to order).
 
 ## What it actually guarantees
 
-Stated narrowly on purpose. Nothing here claims "reliable" or "exactly once."
-
-
 | Boundary                | Guarantee                                                                                                 |
 | ----------------------- | --------------------------------------------------------------------------------------------------------- |
 | client → order          | A required `Idempotency-Key` maps repeated requests to one stored order                                   |
 | order state             | Transitions use an expected status, so concurrent completions can't overwrite each other                  |
 | order → inventory       | 3 attempts on `UNAVAILABLE`/`DEADLINE_EXCEEDED` (100ms, 200ms); the order id makes retries safe           |
 | inventory reservation   | Atomic across all order lines, idempotent for the same order id and basket                                |
-| order → RabbitMQ        | The accepted state and event are committed atomically; an outbox worker publishes the event at least once |
+| order → RabbitMQ        | Best-effort publication after acceptance; there is no outbox, so an event can be lost                      |
 | RabbitMQ → notification | At-least-once processing, *once the event has been routed*                                                |
-| notification effect     | Deduplicated by `(subject, kind, channel)` and protected by a fenced lease                                |
+| notification effect     | Best-effort deduplication by `(subject, kind, channel)`, with a fenced lease                              |
 | failed notification     | 3 provider attempts, then the message parks                                                               |
 
-## The decisions worth asking me about
+## Design decisions and the failures they prevent
 
 ### 1. Stock is never overbooked, and the database is what enforces it
 
@@ -80,7 +81,9 @@ the application must retry.
 The order is stored as `pending` before crossing the gRPC boundary. Every attempt then
 uses the same persisted order ID and item lines, and inventory records that order ID in
 the same transaction that reserves stock. Repeating the same basket returns the recorded
-success without moving stock again; reusing the order ID with different lines is refused.
+success without moving stock again. Different lines are refused when a reservation is
+already visible; the concurrent exception is documented in
+[ARCHITECTURE.md](ARCHITECTURE.md#unresolved-bug-different-concurrent-baskets-can-share-an-order-id).
 If the outcome remains unknown after three attempts, the order stays `pending` rather
 than being guessed `accepted` or `rejected`.
 
@@ -92,17 +95,18 @@ waiting for the other. Sorting makes every transaction acquire the rows in the s
 order. Removing the sort and rerunning the concurrency test reproduces PostgreSQL
 `SQLSTATE 40P01`.
 
-### 4. The transactional outbox prevents accepted orders from losing their events
+### 4. Publication failure leaves the accepted order intact
 
-An accepted order must always have an event waiting to be published, even when RabbitMQ
-is unavailable or the service crashes between database and broker operations. The order's
-`accepted` state and its `OrderAccepted` outbox record are therefore stored in the same
-PostgreSQL transaction: either both are committed or neither is.
+The order is committed as `accepted` before `OrderAccepted` is published. Returning an
+order failure after that commit would misrepresent the stored state, so publication
+errors are logged and the client still receives acceptance.
 
-A background worker publishes pending outbox records to RabbitMQ and retries until the
-broker confirms them. A broker or notification failure can delay processing, but it
-cannot roll back the order or permanently lose the event. Because the worker can publish
-the same record more than once, notification processing remains idempotent.
+Publisher confirms and mandatory routing distinguish successful routing from an
+unroutable message. A confirmation timeout leaves the outcome unknown: the event may
+already have reached a consumer. There is no transactional outbox or recovery worker,
+so an event can be lost between the database commit and publication. Closing that gap
+requires storing acceptance and an event row in one transaction, then publishing through
+an outbox worker; that is not implemented yet.
 
 ### 5. Notification deduplicates the effect, not the message
 
@@ -116,12 +120,16 @@ only after the parked copy has been confirmed.
 
 ### 6. Service boundaries are enforced by the toolchain
 
-Each gRPC or event contract is a producer-owned protobuf module. Local `replace`
+Each gRPC or event contract lives in a service-owned protobuf module. Local `replace`
 directives make an incompatible contract change fail while compiling the same checkout,
 and CI uses `buf breaking` to detect compatibility breaks against `main`. Each contract
 also has its own Buf workspace, so one service's `.proto` cannot silently import another
 service's internal contract. CI regenerates protobuf output and fails if the committed
 code is stale.
+
+These are a selection of the design decisions. **[ARCHITECTURE.md](ARCHITECTURE.md) covers
+the rest, along with the alternatives I rejected and the trade-offs I accepted and why.** It
+also walks through the full request flow and how each failure is handled at every boundary.
 
 ## Run locally
 
@@ -177,6 +185,8 @@ make check             # Compose validation, Buf lint, go vet, and unit tests
 
 ## Deliberate limits
 
+- **No transactional outbox yet.** An accepted order can lose its event, and client
+replay does not republish it.
 - **No automatic recovery worker yet.** A `pending` order is resumed by a later request
 with the same idempotency key, but it can otherwise remain pending indefinitely.
 - **No reservation expiry or release.** A reservation can remain held when the order
@@ -195,9 +205,3 @@ tasks through OpenAI's [Codex plugin for Claude Code](https://github.com/openai/
 Both tools contributed code. I selected the final direction, reviewed the changes, and
 verified the behavior with tests. The architectural decisions and trade-offs documented
 here are the ones I chose and can defend.
-
-## Further reading
-
-`[ARCHITECTURE.md](ARCHITECTURE.md)` contains the full request flow, contract-ownership
-model, failure matrices, RabbitMQ delivery semantics, notification fencing design,
-contention walkthrough, rejected alternatives, and accepted trade-offs.
