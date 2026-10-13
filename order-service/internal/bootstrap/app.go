@@ -79,6 +79,7 @@ func New(
 		rabbitmq.Config{
 			URL:            applicationConfig.RabbitMQURL,
 			PublishTimeout: applicationConfig.RabbitMQPublishTimeout,
+			DialTimeout:    applicationConfig.RabbitMQPublishTimeout,
 			ReconnectDelay: applicationConfig.RabbitMQReconnectDelay,
 			Exchanges: []rabbitmq.ExchangeDeclaration{{
 				Name:       orderevents.ExchangeOrders,

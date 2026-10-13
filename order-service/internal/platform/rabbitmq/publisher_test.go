@@ -205,6 +205,9 @@ func newPublisher(t *testing.T, url string, publishTimeout time.Duration) *rabbi
 		rabbitmq.Config{
 			URL:            url,
 			PublishTimeout: publishTimeout,
+			// Separate from the publish timeout, so a test can make the
+			// confirmation time out without making the connection fail first.
+			DialTimeout: 5 * time.Second,
 			// Short, so a test that deliberately breaks the channel is not made
 			// to wait out a production-sized backoff before the rebuild.
 			ReconnectDelay: time.Millisecond,

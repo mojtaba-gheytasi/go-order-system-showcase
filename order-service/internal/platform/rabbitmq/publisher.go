@@ -49,6 +49,11 @@ type Config struct {
 	URL            string
 	PublishTimeout time.Duration
 
+	// DialTimeout bounds the TCP connect and, separately, the AMQP handshake, so a
+	// dial can take up to twice this. Must be positive: zero leaves no time at all
+	// for the handshake.
+	DialTimeout time.Duration
+
 	// ReconnectDelay keeps a down broker from being dialled once per inbound request.
 	ReconnectDelay time.Duration
 
@@ -133,10 +138,13 @@ func (publisher *Publisher) Publish(ctx context.Context, message Message) error 
 		return fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
 	}
 
-	// Safe only now: a return is delivered before the confirmation.
+	// Safe only now: a return is delivered before the confirmation. A closed
+	// channel holds no return; reading it would yield an empty one.
 	select {
-	case returned := <-returns:
-		return fmt.Errorf("%w: %s (%d)", ErrUnroutable, returned.ReplyText, returned.ReplyCode)
+	case returned, open := <-returns:
+		if open {
+			return fmt.Errorf("%w: %s (%d)", ErrUnroutable, returned.ReplyText, returned.ReplyCode)
+		}
 	default:
 	}
 
@@ -195,7 +203,11 @@ func (publisher *Publisher) ready() (*amqp.Channel, chan amqp.Return, error) {
 
 	publisher.lastDialAt = time.Now()
 
-	connection, err := amqp.Dial(publisher.config.URL)
+	// What amqp.Dial does, plus the deadline.
+	connection, err := amqp.DialConfig(publisher.config.URL, amqp.Config{
+		Locale: "en_US",
+		Dial:   amqp.DefaultDial(publisher.config.DialTimeout),
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: dial: %w", ErrUnavailable, err)
 	}
@@ -261,10 +273,15 @@ func (publisher *Publisher) discard() {
 	publisher.returns = nil
 }
 
+// The library closes the channel when the AMQP channel dies. A closed channel is
+// always ready to read, so without the check this would never return.
 func drain(returns chan amqp.Return) {
 	for {
 		select {
-		case <-returns:
+		case _, open := <-returns:
+			if open == false {
+				return
+			}
 		default:
 			return
 		}
