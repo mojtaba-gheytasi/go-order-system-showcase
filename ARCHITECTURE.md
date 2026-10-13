@@ -7,7 +7,7 @@ were considered, and where the implementation still falls short.
 - [Contracts belong to the service responsible for them](#contracts-belong-to-the-service-responsible-for-them)
 - [A pending order makes an interrupted request resumable](#a-pending-order-makes-an-interrupted-request-resumable)
 - [Inventory checks availability while changing stock](#inventory-checks-availability-while-changing-stock)
-- [Accepting an order does not guarantee publishing its event](#accepting-an-order-does-not-guarantee-publishing-its-event)
+- [An accepted order's event is saved with it](#an-accepted-orders-event-is-saved-with-it)
 - [Consumers choose their subscriptions and retry policy](#consumers-choose-their-subscriptions-and-retry-policy)
 - [Notification claims prevent duplicates within limits](#notification-claims-prevent-duplicates-within-limits)
 - [Tests check the boundaries where failures happen](#tests-check-the-boundaries-where-failures-happen)
@@ -88,8 +88,9 @@ sequenceDiagram
     O->>I: ReserveStock with stored order ID and items
     I->>I: Commit reservation and stock changes
     I-->>O: Stock held
-    O->>DB: Change pending to accepted, if still pending
-    O->>MQ: Attempt OrderAccepted publication
+    O->>DB: Change pending to accepted, if still pending, and save OrderAccepted in the outbox
+    Note over O,MQ: The request ends here. A background worker publishes the event later.
+    O->>MQ: Worker publishes OrderAccepted
 ```
 
 **No database transaction stays open across the inventory call.** Keeping one open
@@ -105,16 +106,17 @@ between those commits:
 | Inventory commits, but its reply is lost | Order is pending; stock is held | Repeat the stored order ID and items. Inventory recognizes the successful reservation. |
 | Inventory succeeds, but saving acceptance fails | Stock may be held while order remains pending | A later request resumes the stored order and tries to complete it. |
 | Two requests finish the same pending order | Both try to change its status | The update requires the expected `pending` state; the loser reloads the winner's result. |
-| Acceptance commits, but event publication fails | Order is accepted; the event may be absent | No automatic recovery exists for the event. An accepted replay does not republish. |
+| Saving the event fails after the status change | Nothing: both are one transaction | The acceptance rolls back with the event, and the order stays pending for a later request. |
+| Acceptance commits, but publication fails | Order is accepted; its event waits in the outbox | The worker retries it (see below). An accepted replay does not record a second event. |
 
 For example, if the client retries after a timeout with a changed basket, a pending
 order resumes with the items already stored. The new request body does not replace them.
 This preserves the reservation identity, although the API does not currently report
 that the client reused its key with a different body.
 
-Pending-order recovery currently depends on another client request. There is no worker
-that finds unfinished orders and resumes them, and no inventory release operation to
-undo a stranded reservation.
+Pending-order recovery currently depends on another client request. The outbox worker
+only publishes events; nothing in the background finds unfinished orders and resumes
+them, and there is no inventory release operation to undo a stranded reservation.
 
 ### Retry an uncertain outcome, not a stock refusal
 
@@ -192,16 +194,79 @@ accepted guarantee.
 See the [reservation store](inventory-service/internal/inventory/adapter/outbound/postgres/reservation_store.go)
 and [schema](inventory-service/migrations/000001_create_stock.up.sql).
 
-## Accepting an order does not guarantee publishing its event
+## An accepted order's event is saved with it
 
-**Publication is best-effort. Processing is at least once after the event is routed
-into a queue.** There is no transactional outbox: acceptance commits first, then the
-request attempts to publish `OrderAccepted`.
+**Publication is at least once.** When order-service accepts an order, the same
+PostgreSQL transaction writes the `OrderAccepted` event into the `outbox_events`
+table. Either both are saved or neither is. The request then returns without waiting
+for RabbitMQ. A worker running in the background inside order-service publishes the
+saved events:
 
-An error after that commit cannot undo acceptance. Order-service logs publication errors
-and returns the accepted order. Returning an order failure would misrepresent the saved
-state, and a client replay would not repair the missing event anyway: it finds the order
-already accepted and skips publication.
+```mermaid
+sequenceDiagram
+    participant R as Worker
+    participant DB as Order database
+    participant MQ as RabbitMQ
+    R->>DB: Claim the next due event, with a lease
+    R->>MQ: Publish and wait for the confirmation
+    MQ-->>R: Routed, not routed, or unknown
+    R->>DB: Mark published, or schedule a retry
+```
+
+Publishing inside the request, as this service first did, had two problems. The
+customer waited for the broker's confirmation. And the event could be lost: if the
+process died after the commit, or the broker was down, nothing remembered that the
+event still had to go out. A client retry did not help either, because a replay of an
+accepted order publishes nothing.
+
+### Claim an event without holding a transaction open
+
+The worker claims one event with a single `UPDATE ... FOR UPDATE SKIP LOCKED` statement.
+Claiming moves the event's `next_attempt_at` forward by the lease (30 seconds by
+default). That is the lease: other workers skip the row until then. No transaction
+stays open while the event is published, for the same reason none stays open across
+the inventory call.
+
+If a worker dies in the middle of a publication, nothing needs cleaning up. The lease
+runs out and the event is claimed again.
+
+Every claim gets a new `claim_token`, and every write after the publication carries
+it. A worker whose lease ran out therefore cannot change the row after another worker
+took it over. The one exception is recording success: "RabbitMQ routed this event"
+stays true whoever held the lease, and recording it can only prevent a duplicate.
+
+All lease and retry times come from PostgreSQL's `now()`, not from the worker's clock,
+so workers on machines whose clocks disagree still agree on when a lease ends.
+
+### Retry what can succeed; stop and keep what cannot
+
+| What happened | What happens to the event |
+| --- | --- |
+| Routed | Marked `published`. |
+| RabbitMQ unreachable | Released without using its retry budget. The worker pauses for 5s, doubling up to 5 minutes, until RabbitMQ is back. |
+| Not routed, rejected, or outcome unknown | One attempt used. Retried after 5s, then 10s, 20s, and so on, up to 5 minutes. |
+| The 10th failed attempt | Marked `needs_attention` and logged as an error. |
+| The event cannot be read or encoded | Marked `needs_attention` at once, because retrying cannot fix it. |
+
+An outage does not use up the budget because it is not the event's fault. If it did,
+every waiting event would need attention after a 20-minute outage, and someone would
+have to redrive all of them by hand. Notification makes the same distinction: a busy
+claim does not use up a send attempt.
+
+Every delay is randomised to a point between half of it and all of it, so events that
+failed together do not all retry at the same moment.
+
+An event that needs attention is never deleted. `make order-outbox-attention` lists
+these events, with their last error. Once the cause is fixed,
+`make order-outbox-redrive` (or `id=<event_id>` for one) returns them to `pending`
+with a fresh budget.
+
+Published events are kept for one month and then deleted, so the table does not grow
+forever. The month leaves time to answer "did this order's event go out, and when?".
+The worker deletes them only when it has nothing to publish, starting at most once an
+hour. It deletes one batch of up to 1,000 rows each time it finds nothing to publish, and
+checks for new events between batches. A new event therefore waits for one short,
+time-limited delete at most, never for a whole backlog.
 
 ### A timeout does not prove that nothing was published
 
@@ -217,35 +282,48 @@ message can be returned and then acknowledged by the broker. Checking only the
 confirmation would incorrectly report success, so the publisher also checks for a return.
 A broker rejection is likewise treated as an error, not as successful publication.
 
+An unknown outcome is retried. That is what makes publication at least once rather
+than at most once, and it is one way the same event can reach RabbitMQ twice. The
+worker logs it separately ("retrying may publish it twice"), so an unknown outcome is
+never reported as a plain failure.
+
 The publisher allows one publication at a time on its channel. That makes a return easy
-to associate with the message currently waiting for confirmation, but limits throughput.
-Waiting for confirmation also adds time to the HTTP request. The confirmation wait has
-a timeout; that is not a bound on the entire publisher call, which also waits for its
-lock and may establish a connection.
+to associate with the message currently waiting for confirmation. It limits throughput,
+but the worker publishes one event at a time anyway.
 
-Publication is detached from the client's cancellation after acceptance. A client hanging
-up should not cancel an announcement about a committed order. The transport can report
-an unknown outcome; the use case's generic “event was not published” log message currently
-fails to preserve that distinction clearly and needs correction.
+The publish timeout bounds the wait for a confirmation. A new connection has its own
+deadline on the connect and on the handshake. Opening a channel after that has none: a
+broker that accepts the connection and then goes silent is noticed only by the AMQP
+heartbeat. The outbox makes that acceptable. An attempt that outlasts its lease can be
+repeated by another worker, which is a duplicate. A worker that cannot stop in time at
+shutdown is abandoned, and the next process claims its event. A stalled broker can cost
+a duplicate or a slow shutdown, but never the event.
 
-### An outbox would close the missing-event gap
+On shutdown, the worker stops claiming as soon as the signal arrives, while HTTP
+requests drain. An event it has already claimed is finished: published, and its outcome
+recorded. Events saved after that wait for the next process.
 
-The change would be to write acceptance and an event row in the same PostgreSQL
-transaction, then let a worker publish outstanding rows. This requires changing the
-repository and use case, not just replacing the AMQP adapter.
+### Consumers still have to deduplicate
 
-It would still permit duplicates. If the worker publishes successfully and crashes
-before marking the row complete, the next attempt publishes again. Consumers must
-continue to deduplicate even after an outbox is added.
+The outbox removes the lost-event gap, not duplicates. A worker that publishes and then
+fails to record success, an unknown outcome, or a lease that runs out mid-publication
+can each publish the same event twice. Every copy carries the same event id.
+Notification deduplicates the email by its effect, but that is itself best-effort, as
+described below.
 
-See the [publisher](order-service/internal/platform/rabbitmq/publisher.go).
+The guarantee covers acceptances saved through the outbox. Orders accepted before it
+existed have no outbox row, and their events are not recovered.
+
+See the [worker](order-service/internal/order/application/publish_order_events.go),
+the [outbox store](order-service/internal/order/adapter/outbound/postgres/outbox.go),
+and the [publisher](order-service/internal/platform/rabbitmq/publisher.go).
 
 ## Consumers choose their subscriptions and retry policy
 
 Order owns the event schema, source exchange, and routing key. Notification owns its
 queues, bindings, retries, and parking policy. Both services declare the source exchange
 so either can start first. Declaring it does not create a consumer queue; an event sent
-before any queue is bound is still unroutable.
+before any queue is bound is unroutable, and the worker retries it within its budget.
 
 ### Topic routing allows broader subscriptions
 
@@ -281,7 +359,8 @@ even if they had already finished successfully.
 Both the working and retry queues use quorum queues, `reject-publish` overflow, and
 at-least-once dead-lettering. These settings protect transfers in both directions;
 protecting only the working queue would leave a loss window on the return trip.
-They cannot recover an event that never reached a queue in the first place.
+An event that never reached a queue is the worker's job instead: it stays in the outbox
+until it is routed or needs attention.
 
 ### Park only after the broker confirms the copy
 
@@ -371,7 +450,9 @@ rollback, broker returns, or dead-letter routing.
 | Evidence | What it checks |
 | --- | --- |
 | [Inventory integration tests](inventory-service/internal/inventory/adapter/outbound/postgres/reservation_store_test.go) | Stock contention, identical concurrent claims, and rollback when a later line fails. They do not cover the disjoint-basket bug. |
-| [Publisher integration tests](order-service/internal/platform/rabbitmq/publisher_test.go) | Routed, unroutable, and unknown outcomes, plus channel recovery. |
+| [Publisher integration tests](order-service/internal/platform/rabbitmq/publisher_test.go) | Routed, unroutable, and unknown outcomes, plus channel recovery. A [dial test](order-service/internal/platform/rabbitmq/dial_test.go) checks the handshake deadline. |
+| [Order repository tests](order-service/internal/order/adapter/outbound/postgres/order_repository_test.go) and [outbox store tests](order-service/internal/order/adapter/outbound/postgres/outbox_test.go) | The acceptance rolls back when its event cannot be saved, racing acceptances save one event, and concurrent claims, lease takeovers, stale writes, redrive and the one-month cleanup behave as described. |
+| [Worker tests](order-service/internal/order/application/publish_order_events_internal_test.go) | Every row of the retry policy, the backoff and jitter, and finishing a claimed event during shutdown. |
 | [Notification store tests](notification-service/internal/notification/adapter/outbound/postgres/sent_notification_store_test.go) | Exclusive claims, expired-lease takeover, and stale-token rejection. |
 | [Consumer tests](notification-service/internal/notification/adapter/inbound/amqpapi/consumer_test.go) and [topology tests](notification-service/internal/notification/adapter/inbound/amqpapi/topology_test.go) | Acknowledgement, retry, parking, and the configured broker routing. |
 
@@ -387,7 +468,9 @@ The deliberate trade-offs are:
 - **Contracts evolve separately.** Service-owned modules keep dependencies narrow but
   require per-module configuration and compatibility discipline.
 - **Publishing is serialized.** Associating broker returns with one active message is
-  simple, at the cost of throughput and added request latency.
+  simple, at the cost of throughput. The worker publishes one event at a time.
+- **Events wait for the worker.** An idle worker checks the outbox once per poll interval
+  (1 second by default), so an event can take that long to start publishing.
 - **Retries can produce duplicates.** Notification favors another attempt after an
   uncertain send; parking favors preserving a delivery after an uncertain publication.
   Provider idempotency is needed to prevent duplicate emails in those cases.
@@ -398,8 +481,8 @@ The unresolved bugs and missing recovery features are:
 
 - **Concurrent different baskets can share an order ID.** Inventory needs a claim for
   the whole order, with an integration test for disjoint baskets.
-- **There is no outbox.** Accepted orders can lose their events, and nothing reconciles
-  them. Publication logging also needs to distinguish unknown outcomes clearly.
+- **Events that need attention wait for a person.** They are logged as errors and listed
+  by a Make target, but nothing alerts on them, and redrive is manual.
 - **Pending orders need client replay; reservations never expire.** Automatic recovery
   and a release policy are missing.
 - **Reused client keys are not compared with request bodies.** The stored order wins
