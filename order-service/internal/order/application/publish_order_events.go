@@ -16,6 +16,16 @@ const (
 	publishRetryInitialDelay = 5 * time.Second
 	publishRetryMaxDelay     = 5 * time.Minute
 	outboxWriteTimeout       = 5 * time.Second
+
+	// Published events are kept for a month, so "did this order's event go out,
+	// and when?" can still be answered, and then deleted so the table does not
+	// grow forever. Events that need attention are never deleted.
+	publishedEventRetention = 30 * 24 * time.Hour
+	outboxCleanupInterval   = time.Hour
+
+	// Deleting in batches keeps each statement short, so it never holds locks
+	// for long while orders are being accepted.
+	outboxCleanupBatchSize = 1000
 )
 
 // PublishOrderEvents is the outbox worker: it publishes the events that order
@@ -36,11 +46,18 @@ type PublishOrderEvents struct {
 
 	// random returns a value in [0, n). Injected so tests can fix the jitter.
 	random func(n int64) int64
+	clock  Clock
 	logger zerolog.Logger
 
-	// outages counts consecutive attempts that could not reach the broker. Only
-	// the goroutine running Run touches it.
+	// Only the goroutine running Run touches the fields below.
+	//
+	// outages counts consecutive attempts that could not reach the broker.
 	outages int
+
+	// lastCleanup is when the current cleanup round started, and
+	// cleanupUnfinished says that round's last batch was full.
+	lastCleanup       time.Time
+	cleanupUnfinished bool
 }
 
 func NewPublishOrderEvents(
@@ -49,6 +66,7 @@ func NewPublishOrderEvents(
 	lease time.Duration,
 	pollInterval time.Duration,
 	random func(n int64) int64,
+	clock Clock,
 	logger zerolog.Logger,
 ) *PublishOrderEvents {
 	return &PublishOrderEvents{
@@ -57,6 +75,7 @@ func NewPublishOrderEvents(
 		lease:        lease,
 		pollInterval: pollInterval,
 		random:       random,
+		clock:        clock,
 		logger:       logger,
 	}
 }
@@ -83,6 +102,8 @@ func (useCase *PublishOrderEvents) publishNext(ctx context.Context) time.Duratio
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrOutboxEmpty):
+		useCase.deleteOldPublishedEvents(ctx)
+
 		return useCase.pollInterval
 	case errors.Is(err, ErrEventUnpublishable):
 		useCase.setAside(context.WithoutCancel(ctx), entry, false, err)
@@ -214,6 +235,39 @@ func (useCase *PublishOrderEvents) logEntry(event *zerolog.Event, entry OutboxEn
 	return event.
 		Str("event_id", entry.EventID).
 		Str("order_id", string(entry.Event.OrderID))
+}
+
+// deleteOldPublishedEvents runs only when there is nothing to publish, and
+// deletes at most one batch per call. A backlog is worked through one batch per
+// idle poll, with a claim in between each, so a new event waits for one short,
+// time-limited statement at most, never for the whole backlog.
+func (useCase *PublishOrderEvents) deleteOldPublishedEvents(ctx context.Context) {
+	now := useCase.clock()
+	if useCase.cleanupUnfinished == false {
+		if now.Sub(useCase.lastCleanup) < outboxCleanupInterval {
+			return
+		}
+		useCase.lastCleanup = now
+	}
+
+	deleteCtx, cancel := context.WithTimeout(ctx, outboxWriteTimeout)
+	defer cancel()
+
+	deleted, err := useCase.outbox.DeletePublished(deleteCtx, publishedEventRetention, outboxCleanupBatchSize)
+	if err != nil {
+		useCase.cleanupUnfinished = false
+		if ctx.Err() == nil {
+			useCase.logger.Warn().Err(err).Msg("delete old published outbox events")
+		}
+
+		return
+	}
+
+	// A full batch means there may be more; the next idle poll carries on.
+	useCase.cleanupUnfinished = deleted == outboxCleanupBatchSize
+	if deleted > 0 {
+		useCase.logger.Info().Int("deleted", deleted).Msg("deleted old published outbox events")
+	}
 }
 
 // retryDelay doubles from the initial delay up to the cap, then picks a random

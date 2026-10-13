@@ -65,6 +65,7 @@ func New(dependencies Dependencies) (*Module, error) {
 		dependencies.OutboxLease,
 		dependencies.OutboxPollInterval,
 		rand.Int64N,
+		now,
 		dependencies.Logger,
 	)
 

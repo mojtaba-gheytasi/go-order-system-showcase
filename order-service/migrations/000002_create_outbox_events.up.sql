@@ -52,4 +52,8 @@ CREATE TABLE outbox_events (
 CREATE INDEX outbox_events_due_idx ON outbox_events (next_attempt_at)
     WHERE status = 'pending';
 
+-- Lets the cleanup find old published events without reading the whole table.
+CREATE INDEX outbox_events_published_idx ON outbox_events (published_at)
+    WHERE status = 'published';
+
 COMMIT;

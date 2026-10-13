@@ -86,6 +86,10 @@ type EventOutbox interface {
 	// MarkNeedsAttention stops automatic retries. countAttempt is false for a
 	// permanent failure, which never reached the broker.
 	MarkNeedsAttention(ctx context.Context, entry OutboxEntry, countAttempt bool, reason string) error
+
+	// DeletePublished deletes up to limit events published more than olderThan
+	// ago, and reports how many it deleted.
+	DeletePublished(ctx context.Context, olderThan time.Duration, limit int) (int, error)
 }
 
 type Clock func() time.Time

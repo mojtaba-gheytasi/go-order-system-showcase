@@ -222,6 +222,59 @@ func TestEventOutboxReportsAnUnreadableEventSoItCanBeSetAside(t *testing.T) {
 	assert.Equal(t, 0, row.attempts, "it never reached the broker")
 }
 
+// Only published events past the age are deleted. A pending event still has to go
+// out, and one that needs attention is waiting for a person, whatever their age.
+func TestEventOutboxDeletesOnlyOldPublishedEvents(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	outbox := postgres.NewEventOutbox(db)
+	seedEvents(t, db, 5)
+
+	for range 3 {
+		entry, err := outbox.ClaimNext(ctx, longLease)
+		require.NoError(t, err)
+		require.NoError(t, outbox.MarkPublished(ctx, entry.EventID))
+	}
+	entry, err := outbox.ClaimNext(ctx, longLease)
+	require.NoError(t, err)
+	require.NoError(t, outbox.MarkNeedsAttention(ctx, entry, true, "no queue bound"))
+
+	// Age everything except one published event by two months.
+	_, err = db.ExecContext(ctx, `
+		UPDATE outbox_events
+		   SET created_at = created_at - interval '2 months',
+		       published_at = published_at - interval '2 months',
+		       needs_attention_at = needs_attention_at - interval '2 months'
+		 WHERE event_id <> (
+		       SELECT event_id FROM outbox_events
+		        WHERE status = 'published'
+		        ORDER BY event_id
+		        LIMIT 1)`)
+	require.NoError(t, err)
+
+	deleted, err := outbox.DeletePublished(ctx, 30*24*time.Hour, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted, "the limit caps one batch")
+
+	deleted, err = outbox.DeletePublished(ctx, 30*24*time.Hour, 1000)
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted)
+
+	var remaining []string
+	rows, err := db.QueryContext(ctx, `SELECT status FROM outbox_events ORDER BY status`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		require.NoError(t, rows.Scan(&status))
+		remaining = append(remaining, status)
+	}
+	require.NoError(t, rows.Err())
+
+	assert.Equal(t, []string{"needs_attention", "pending", "published"}, remaining,
+		"kept: the old event that needs attention, the pending one, and the recent published one")
+}
+
 // The same statement `make order-outbox-redrive` runs.
 func TestRedrivingAnEventGivesItAFreshBudget(t *testing.T) {
 	ctx := context.Background()

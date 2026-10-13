@@ -188,6 +188,68 @@ func TestRetryDelayDoublesUpToTheCapAndJittersWithinItsUpperHalf(t *testing.T) {
 	}
 }
 
+// Cleanup only runs when there is nothing to publish, so it never delays an
+// event, and at most once an hour, so an idle worker does not run it every poll.
+func TestWorkerDeletesOldPublishedEventsWhenIdleAtMostHourly(t *testing.T) {
+	worker := newTestWorker()
+
+	worker.useCase.publishNext(context.Background())
+	require.Len(t, worker.outbox.deleteCalls, 1, "the first idle poll cleans up")
+	assert.Equal(t, 30*24*time.Hour, worker.outbox.deleteCalls[0].olderThan, "published events are kept for a month")
+
+	worker.now = worker.now.Add(59 * time.Minute)
+	worker.useCase.publishNext(context.Background())
+	assert.Len(t, worker.outbox.deleteCalls, 1, "not again within the hour")
+
+	worker.now = worker.now.Add(time.Minute)
+	worker.useCase.publishNext(context.Background())
+	assert.Len(t, worker.outbox.deleteCalls, 2, "again once the hour is up")
+}
+
+func TestWorkerDoesNotCleanUpWhileThereIsWorkToDo(t *testing.T) {
+	worker := newTestWorker(claimed(testEntry(0)))
+
+	worker.useCase.publishNext(context.Background())
+
+	assert.Empty(t, worker.outbox.deleteCalls)
+}
+
+// A backlog is deleted one batch per idle poll, so an event that arrives in the
+// middle is claimed after at most one batch, not after the whole backlog.
+func TestWorkerDeletesABacklogOneBatchAtATime(t *testing.T) {
+	worker := newTestWorker()
+	worker.outbox.deleteResults = []deleteResult{
+		{deleted: outboxCleanupBatchSize},
+		{deleted: outboxCleanupBatchSize},
+		{deleted: 7},
+	}
+
+	worker.useCase.publishNext(context.Background())
+	assert.Len(t, worker.outbox.deleteCalls, 1, "one batch, then back to claiming")
+
+	worker.outbox.claims = []claimResult{claimed(testEntry(0))}
+	worker.useCase.publishNext(context.Background())
+	assert.Equal(t, []string{"event-1"}, worker.outbox.published, "the new event goes first")
+	assert.Len(t, worker.outbox.deleteCalls, 1)
+
+	worker.useCase.publishNext(context.Background())
+	worker.useCase.publishNext(context.Background())
+	assert.Len(t, worker.outbox.deleteCalls, 3, "the round carries on without waiting an hour")
+
+	worker.useCase.publishNext(context.Background())
+	assert.Len(t, worker.outbox.deleteCalls, 3, "a batch that was not full ends the round")
+}
+
+func TestWorkerKeepsPublishingWhenCleanupFails(t *testing.T) {
+	worker := newTestWorker()
+	worker.outbox.deleteResults = []deleteResult{{err: errors.New("database unavailable")}}
+
+	pause := worker.useCase.publishNext(context.Background())
+
+	assert.Equal(t, testPollInterval, pause)
+	assert.Contains(t, worker.logs.String(), "delete old published outbox events")
+}
+
 // Shutdown must not cut a claimed event in half: the publication finishes and
 // its outcome is written, even though the context is cancelled meanwhile.
 func TestRunFinishesTheClaimedEventWhenCancelled(t *testing.T) {
@@ -237,6 +299,9 @@ type testWorker struct {
 	outbox    *fakeOutbox
 	publisher *fakePublisher
 	logs      *bytes.Buffer
+
+	// now is what the worker's clock reads; a test moves it forward.
+	now time.Time
 }
 
 func newTestWorker(claims ...claimResult) *testWorker {
@@ -244,6 +309,7 @@ func newTestWorker(claims ...claimResult) *testWorker {
 		outbox:    &fakeOutbox{claims: claims},
 		publisher: &fakePublisher{},
 		logs:      &bytes.Buffer{},
+		now:       time.Date(2026, time.October, 13, 9, 0, 0, 0, time.UTC),
 	}
 
 	worker.useCase = NewPublishOrderEvents(
@@ -253,6 +319,7 @@ func newTestWorker(claims ...claimResult) *testWorker {
 		testPollInterval,
 		// The longest delay, so expected values read as plain doublings.
 		func(n int64) int64 { return n - 1 },
+		func() time.Time { return worker.now },
 		zerolog.New(worker.logs),
 	)
 
@@ -305,6 +372,33 @@ type fakeOutbox struct {
 	released  []releaseCall
 	retries   []retryCall
 	setAside  []attentionCall
+
+	// deleteResults are returned by DeletePublished in turn; once used up, it
+	// deletes nothing.
+	deleteResults []deleteResult
+	deleteCalls   []deleteCall
+}
+
+type deleteResult struct {
+	deleted int
+	err     error
+}
+
+type deleteCall struct {
+	olderThan time.Duration
+	limit     int
+}
+
+func (outbox *fakeOutbox) DeletePublished(_ context.Context, olderThan time.Duration, limit int) (int, error) {
+	outbox.deleteCalls = append(outbox.deleteCalls, deleteCall{olderThan: olderThan, limit: limit})
+	if len(outbox.deleteResults) == 0 {
+		return 0, nil
+	}
+
+	next := outbox.deleteResults[0]
+	outbox.deleteResults = outbox.deleteResults[1:]
+
+	return next.deleted, next.err
 }
 
 func (outbox *fakeOutbox) ClaimNext(context.Context, time.Duration) (OutboxEntry, error) {

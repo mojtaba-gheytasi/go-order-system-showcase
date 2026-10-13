@@ -59,6 +59,15 @@ const (
 		       needs_attention_at = now(),
 		       last_error = $4
 		 WHERE event_id = $1 AND claim_token = $2 AND status = 'pending'`
+
+	deletePublishedOutboxEventsQuery = `
+		DELETE FROM outbox_events
+		 WHERE status = 'published'
+		   AND event_id IN (
+		       SELECT event_id
+		         FROM outbox_events
+		        WHERE status = 'published' AND published_at < now() - $1::interval
+		        LIMIT $2)`
 )
 
 type EventOutbox struct {
@@ -172,6 +181,24 @@ func (outbox *EventOutbox) MarkNeedsAttention(
 		increment,
 		reason,
 	)
+}
+
+func (outbox *EventOutbox) DeletePublished(
+	ctx context.Context,
+	olderThan time.Duration,
+	limit int,
+) (int, error) {
+	result, err := outbox.db.ExecContext(ctx, deletePublishedOutboxEventsQuery, intervalFor(olderThan), limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete published outbox events: %w", err)
+	}
+
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete published outbox events: %w", err)
+	}
+
+	return int(deleted), nil
 }
 
 // execFenced runs a write that only the current claim may make. Zero rows means
