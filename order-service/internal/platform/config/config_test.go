@@ -30,6 +30,8 @@ INVENTORY_GRPC_TIMEOUT=3s
 RABBITMQ_URL=amqp://orders:secret@rabbitmq:5672/
 RABBITMQ_PUBLISH_TIMEOUT=2s
 RABBITMQ_RECONNECT_DELAY=5s
+OUTBOX_POLL_INTERVAL=1s
+OUTBOX_CLAIM_LEASE=30s
 `
 
 func TestLoadReadsOptionalLocalEnvironmentFile(t *testing.T) {
@@ -57,6 +59,8 @@ func TestLoadReadsOptionalLocalEnvironmentFile(t *testing.T) {
 	assert.Equal(t, "amqp://orders:secret@rabbitmq:5672/", loaded.RabbitMQURL)
 	assert.Equal(t, 2*time.Second, loaded.RabbitMQPublishTimeout)
 	assert.Equal(t, 5*time.Second, loaded.RabbitMQReconnectDelay)
+	assert.Equal(t, time.Second, loaded.OutboxPollInterval)
+	assert.Equal(t, 30*time.Second, loaded.OutboxClaimLease)
 }
 
 func TestLoadAllowsEnvironmentToOverrideConfigFile(t *testing.T) {
@@ -116,6 +120,8 @@ INVENTORY_GRPC_TIMEOUT=3s
 RABBITMQ_URL=amqp://orders:secret@rabbitmq:5672/
 RABBITMQ_PUBLISH_TIMEOUT=2s
 RABBITMQ_RECONNECT_DELAY=5s
+OUTBOX_POLL_INTERVAL=1s
+OUTBOX_CLAIM_LEASE=30s
 `)
 
 	_, err := config.Load(directory)
@@ -143,12 +149,27 @@ INVENTORY_GRPC_TIMEOUT=3s
 RABBITMQ_URL=amqp://orders:secret@rabbitmq:5672/
 RABBITMQ_PUBLISH_TIMEOUT=2s
 RABBITMQ_RECONNECT_DELAY=5s
+OUTBOX_POLL_INTERVAL=1s
+OUTBOX_CLAIM_LEASE=30s
 `)
 
 	_, err := config.Load(directory)
 
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "validate configuration")
+}
+
+// A lease that can run out during one slow publication lets a second worker
+// publish the same event while the first is still at it.
+func TestLoadRejectsAClaimLeaseShorterThanASlowPublication(t *testing.T) {
+	directory := t.TempDir()
+	shortLease := strings.Replace(validConfigFile, "OUTBOX_CLAIM_LEASE=30s", "OUTBOX_CLAIM_LEASE=11s", 1)
+	writeConfigFile(t, directory, shortLease)
+
+	_, err := config.Load(directory)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "OUTBOX_CLAIM_LEASE must be longer than 11s")
 }
 
 func TestLoadRejectsMissingBoolean(t *testing.T) {

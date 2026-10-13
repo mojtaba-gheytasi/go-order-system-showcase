@@ -16,6 +16,18 @@ var (
 	ErrInsufficientStock = errors.New("insufficient stock")
 
 	ErrInventoryUnavailable = errors.New("inventory unavailable")
+
+	ErrOutboxEmpty = errors.New("no outbox event is due")
+
+	// ErrOutboxClaimLost means the claim's lease ran out and another worker now
+	// owns the row, so the write was refused.
+	ErrOutboxClaimLost = errors.New("outbox claim lost")
+
+	// The worker's retry policy depends on which of these a publication failed
+	// with, so the adapters translate their transport errors into them.
+	ErrPublisherUnavailable      = errors.New("event publisher unavailable")
+	ErrPublicationOutcomeUnknown = errors.New("publication outcome unknown")
+	ErrEventUnpublishable        = errors.New("event cannot be published")
 )
 
 // The errors below name what a caller has to change to succeed. Each unwraps to

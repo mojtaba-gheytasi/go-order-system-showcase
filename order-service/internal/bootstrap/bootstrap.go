@@ -46,8 +46,32 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
+
+	// The worker stops taking new events as soon as a signal arrives, while HTTP
+	// is still draining. Events stored meanwhile wait in the outbox for the next
+	// process, so nothing is lost by stopping it early.
+	workerCtx, stopWorker := context.WithCancel(signalCtx)
+	workerDone := make(chan struct{})
+	go func() {
+		app.RunEventWorker(workerCtx)
+		close(workerDone)
+	}()
+
+	// A defer, so the worker is stopped before Close on every way out of Run,
+	// including a server that failed to start.
 	defer func() {
+		stopWorker()
+		if waitFor(workerDone, shutdownTimeout) == false {
+			// Close would wait for the publisher the worker is stuck in. The
+			// process is exiting anyway, and the event it holds is claimed again
+			// by the next process once its lease runs out.
+			logger.Warn().Msg("event worker did not stop in time; skipping cleanup")
+
+			return
+		}
+
 		_ = app.Close()
+		logger.Info().Msg("shutdown complete")
 	}()
 
 	serverFailed := make(chan error, 1)
@@ -75,7 +99,18 @@ func Run(ctx context.Context, options Options) error {
 		return fmt.Errorf("shut down HTTP server: %w", err)
 	}
 
-	logger.Info().Msg("shutdown complete")
-
 	return nil
+}
+
+// waitFor reports whether done closed within the timeout.
+func waitFor(done <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }

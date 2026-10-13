@@ -33,7 +33,13 @@ type Config struct {
 	RabbitMQURL            string        `mapstructure:"RABBITMQ_URL" validate:"required"`
 	RabbitMQPublishTimeout time.Duration `mapstructure:"RABBITMQ_PUBLISH_TIMEOUT" validate:"gt=0"`
 	RabbitMQReconnectDelay time.Duration `mapstructure:"RABBITMQ_RECONNECT_DELAY" validate:"gt=0"`
+	OutboxPollInterval     time.Duration `mapstructure:"OUTBOX_POLL_INTERVAL" validate:"gt=0"`
+	OutboxClaimLease       time.Duration `mapstructure:"OUTBOX_CLAIM_LEASE" validate:"gt=0"`
 }
+
+// outboxWriteAllowance covers recording the outcome of a publication, which the
+// claim lease has to outlast as well.
+const outboxWriteAllowance = 5 * time.Second
 
 func Load(path string) (Config, error) {
 	configPath := strings.TrimSpace(path)
@@ -62,6 +68,19 @@ func Load(path string) (Config, error) {
 	validate := validator.New(validator.WithRequiredStructEnabled())
 	if err := validate.Struct(loaded); err != nil {
 		return Config{}, fmt.Errorf("validate configuration: %w", err)
+	}
+
+	// A lease that runs out while its worker is still publishing lets a second worker
+	// publish the same event. A normal slow attempt is a connect, a handshake and a
+	// confirmation, each bounded by the publish timeout, then one write.
+	slowestAttempt := 3*loaded.RabbitMQPublishTimeout + outboxWriteAllowance
+	if loaded.OutboxClaimLease <= slowestAttempt {
+		return Config{}, fmt.Errorf(
+			"validate configuration: OUTBOX_CLAIM_LEASE must be longer than %s "+
+				"(three times RABBITMQ_PUBLISH_TIMEOUT plus %s)",
+			slowestAttempt,
+			outboxWriteAllowance,
+		)
 	}
 
 	return loaded, nil

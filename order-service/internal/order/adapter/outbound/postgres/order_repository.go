@@ -11,6 +11,7 @@ import (
 
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/domain"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/correlation"
 )
 
 const (
@@ -42,6 +43,15 @@ const (
 			status = $1,
 			updated_at = $2
 		WHERE id = $3 AND status = $4`
+
+	insertOutboxEventQuery = `
+		INSERT INTO outbox_events (
+			event_id,
+			event_type,
+			order_id,
+			payload,
+			correlation_id
+		) VALUES ($1, $2, $3, $4, $5)`
 
 	findOrderByIDQuery = `
 		SELECT
@@ -162,7 +172,75 @@ func (repository *OrderRepository) Update(
 		return fmt.Errorf("map order for update: %w", err)
 	}
 
-	result, err := repository.db.ExecContext(
+	return updateOrderState(ctx, repository.db, storedOrder, expectedStatus)
+}
+
+func (repository *OrderRepository) UpdateAndRecordEvent(
+	ctx context.Context,
+	order *domain.Order,
+	expectedStatus domain.Status,
+	event application.OrderAcceptedEvent,
+) error {
+	storedOrder, _, err := rowsFromDomain(order)
+	if err != nil {
+		return fmt.Errorf("map order for update: %w", err)
+	}
+
+	eventID, err := uuid.Parse(event.EventID)
+	if err != nil {
+		return fmt.Errorf("parse event id: %w", err)
+	}
+
+	payload, err := payloadFromEvent(event)
+	if err != nil {
+		return fmt.Errorf("encode outbox payload: %w", err)
+	}
+
+	transaction, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin update and record event transaction: %w", err)
+	}
+	defer func() {
+		_ = transaction.Rollback()
+	}()
+
+	if err := updateOrderState(ctx, transaction, storedOrder, expectedStatus); err != nil {
+		return err
+	}
+
+	_, err = transaction.ExecContext(
+		ctx,
+		insertOutboxEventQuery,
+		eventID,
+		eventTypeOrderAccepted,
+		storedOrder.id,
+		payload,
+		correlation.FromContext(ctx),
+	)
+	if err != nil {
+		return fmt.Errorf("insert outbox event: %w", err)
+	}
+
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit update and record event transaction: %w", err)
+	}
+
+	return nil
+}
+
+// executor is what a conditional state update needs, so it can run on its own
+// or inside a transaction.
+type executor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func updateOrderState(
+	ctx context.Context,
+	database executor,
+	storedOrder orderRow,
+	expectedStatus domain.Status,
+) error {
+	result, err := database.ExecContext(
 		ctx,
 		updateOrderStateQuery,
 		storedOrder.status,

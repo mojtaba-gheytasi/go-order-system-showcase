@@ -5,6 +5,7 @@ package wiring
 
 import (
 	"database/sql"
+	"math/rand/v2"
 	"net/http"
 	"time"
 
@@ -20,17 +21,23 @@ import (
 )
 
 type Dependencies struct {
-	DB               *sql.DB
-	Logger           zerolog.Logger
-	Clock            func() time.Time
-	NewID            func() string
-	InventoryConn    *grpc.ClientConn
-	InventoryTimeout time.Duration
-	EventPublisher   ordereventamqp.MessagePublisher
+	DB                 *sql.DB
+	Logger             zerolog.Logger
+	Clock              func() time.Time
+	NewID              func() string
+	InventoryConn      *grpc.ClientConn
+	InventoryTimeout   time.Duration
+	EventPublisher     ordereventamqp.MessagePublisher
+	OutboxPollInterval time.Duration
+	OutboxLease        time.Duration
 }
 
 type Module struct {
 	HTTPHandler http.Handler
+
+	// EventWorker publishes the events order creation stores. The caller decides
+	// when it runs and must stop it before closing the database or the publisher.
+	EventWorker *application.PublishOrderEvents
 }
 
 func New(dependencies Dependencies) (*Module, error) {
@@ -48,9 +55,16 @@ func New(dependencies Dependencies) (*Module, error) {
 		orderpostgres.NewOrderRepository(dependencies.DB),
 		catalogstub.New(),
 		inventory,
-		ordereventamqp.NewPublisher(dependencies.EventPublisher),
 		now,
 		newID,
+	)
+
+	eventWorker := application.NewPublishOrderEvents(
+		orderpostgres.NewEventOutbox(dependencies.DB),
+		ordereventamqp.NewPublisher(dependencies.EventPublisher),
+		dependencies.OutboxLease,
+		dependencies.OutboxPollInterval,
+		rand.Int64N,
 		dependencies.Logger,
 	)
 
@@ -59,5 +73,6 @@ func New(dependencies Dependencies) (*Module, error) {
 			Logger:      dependencies.Logger,
 			CreateOrder: createOrder,
 		}),
+		EventWorker: eventWorker,
 	}, nil
 }

@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rs/zerolog"
-
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/domain"
 )
 
@@ -38,29 +36,23 @@ type CreateOrder struct {
 	orders    OrderRepository
 	catalog   ProductCatalog
 	inventory InventoryReserver
-	events    OrderEventPublisher
 	clock     Clock
 	newID     IDGenerator
-	logger    zerolog.Logger
 }
 
 func NewCreateOrder(
 	orders OrderRepository,
 	catalog ProductCatalog,
 	inventory InventoryReserver,
-	events OrderEventPublisher,
 	clock Clock,
 	newID IDGenerator,
-	logger zerolog.Logger,
 ) *CreateOrder {
 	return &CreateOrder{
 		orders:    orders,
 		catalog:   catalog,
 		inventory: inventory,
-		events:    events,
 		clock:     clock,
 		newID:     newID,
-		logger:    logger,
 	}
 }
 
@@ -141,15 +133,18 @@ func (useCase *CreateOrder) processPending(
 		return CreateOrderResult{}, fmt.Errorf("accept order: %w", err)
 	}
 
-	if err := useCase.orders.Update(ctx, order, domain.StatusPending); err != nil {
+	// The event is stored with the acceptance rather than published here. The
+	// customer does not wait for the broker, and an acceptance cannot be committed
+	// without the event that announces it. Only the request that stores the
+	// acceptance records the event, so a replay never records a second one.
+	event := newOrderAcceptedEvent(useCase.newID(), order)
+	if err := useCase.orders.UpdateAndRecordEvent(ctx, order, domain.StatusPending, event); err != nil {
 		if errors.Is(err, ErrOrderStateConflict) {
 			return useCase.resultAfterConflict(ctx, order.ID(), created)
 		}
 
 		return CreateOrderResult{}, fmt.Errorf("persist accepted order: %w", err)
 	}
-
-	useCase.publish(ctx, order)
 
 	return CreateOrderResult{Order: order, Created: created}, nil
 }
@@ -319,27 +314,4 @@ func productSKUs(items []CreateOrderItem) []string {
 	}
 
 	return productSKUs
-}
-
-// publish announces the acceptance, and swallows any failure.
-//
-// The order is already durably accepted at this point. Turning a publication
-// failure into an API error would tell the client its order failed when it did
-// not, inviting a retry that cannot help — the retry finds the order accepted and
-// publishes nothing, because only the request that stores the acceptance
-// publishes. There is no outbox, so a lost event stays lost and this log line is
-// the only record of it.
-//
-// The snapshot is taken here rather than inside the adapter so that the event's
-// identity and timestamp are decided once, by the layer that owns the fact.
-func (useCase *CreateOrder) publish(ctx context.Context, order *domain.Order) {
-	event := newOrderAcceptedEvent(useCase.newID(), order)
-
-	if err := useCase.events.PublishOrderAccepted(ctx, event); err != nil {
-		useCase.logger.Warn().
-			Err(err).
-			Str("order_id", string(order.ID())).
-			Str("event_id", event.EventID).
-			Msg("order accepted but its event was not published")
-	}
 }
