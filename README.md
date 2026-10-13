@@ -21,7 +21,7 @@ or the need for a different programming language or technology.
 flowchart LR
     Client -->|POST /orders| Order[order-service]
     Order ==>|ReserveStock gRPC| Inventory[inventory-service]
-    Order -.->|OrderAccepted AMQP| RabbitMQ[(RabbitMQ)]
+    Order -.->|OrderAccepted AMQP, from the outbox| RabbitMQ[(RabbitMQ)]
     RabbitMQ -.-> Notification[notification-service]
     Order --- OrderDB[(orders PostgreSQL)]
     Inventory --- InventoryDB[(inventory PostgreSQL)]
@@ -29,11 +29,6 @@ flowchart LR
 ```
 
 #### Why three services
-
-I have identified three logical boundaries: order, inventory, and notification. For this
-showcase, I deliberately map them to three independently deployable services **to demonstrate
-how I handle partial failures, cross-service consistency, retries, idempotency, and 
-asynchronous communication.**
 
 Together, they make two different failure models concrete in one workflow:
 
@@ -54,7 +49,7 @@ belong to the producer (`OrderAccepted` belongs to order).
 | order state             | Transitions use an expected status, so concurrent completions can't overwrite each other                  |
 | order → inventory       | 3 attempts on `UNAVAILABLE`/`DEADLINE_EXCEEDED` (100ms, 200ms); the order id makes retries safe           |
 | inventory reservation   | Atomic across all order lines, idempotent for the same order id and basket                                |
-| order → RabbitMQ        | Best-effort publication after acceptance; there is no outbox, so an event can be lost                      |
+| order → RabbitMQ        | At-least-once publication: the event commits with the acceptance and is retried until routed; after 10 failed attempts it waits for a redrive |
 | RabbitMQ → notification | At-least-once processing, *once the event has been routed*                                                |
 | notification effect     | Best-effort deduplication by `(subject, kind, channel)`, with a fenced lease                              |
 | failed notification     | 3 provider attempts, then the message parks                                                               |
@@ -95,18 +90,25 @@ waiting for the other. Sorting makes every transaction acquire the rows in the s
 order. Removing the sort and rerunning the concurrency test reproduces PostgreSQL
 `SQLSTATE 40P01`.
 
-### 4. Publication failure leaves the accepted order intact
+### 4. A transactional outbox keeps order creation independent of RabbitMQ
 
-The order is committed as `accepted` before `OrderAccepted` is published. Returning an
-order failure after that commit would misrepresent the stored state, so publication
-errors are logged and the client still receives acceptance.
+Order-service uses the transactional outbox pattern. Accepting an order and saving its
+`OrderAccepted` event happen in one database transaction, so neither can exist without
+the other. A background worker in order-service publishes the saved events afterwards.
 
-Publisher confirms and mandatory routing distinguish successful routing from an
-unroutable message. A confirmation timeout leaves the outcome unknown: the event may
-already have reached a consumer. There is no transactional outbox or recovery worker,
-so an event can be lost between the database commit and publication. Closing that gap
-requires storing acceptance and an event row in one transaction, then publishing through
-an outbox worker; that is not implemented yet.
+This prevents two failures:
+
+- **A slow or unavailable broker holding up orders.** The customer gets `201` as soon as
+  the order is saved. RabbitMQ being slow or down does not delay or fail order creation.
+- **A lost event.** If the service crashes right after accepting an order, or RabbitMQ is
+  down, the event is still in the database and goes out later. An event is never
+  silently dropped: it is retried until RabbitMQ confirms it was routed, and one that
+  keeps failing is kept for a person to redrive.
+
+A retry can publish the same event twice, which is why notification deduplicates
+(decision 5). The retry policy, and how workers avoid publishing the same event at the
+same time, are in
+[ARCHITECTURE.md](ARCHITECTURE.md#an-accepted-orders-event-is-saved-with-it).
 
 ### 5. Notification deduplicates the effect, not the message
 
@@ -141,7 +143,9 @@ make up
 ```
 
 This builds and starts the three services, three PostgreSQL databases, migrations, the
-development stock seed, and RabbitMQ. Submit an order:
+development stock seed, and RabbitMQ. If you already have your own `order-service/.env`,
+add `OUTBOX_POLL_INTERVAL=1s` and `OUTBOX_CLAIM_LEASE=30s` to it first; order-service
+refuses to start without them. Submit an order:
 
 ```bash
 curl -i -X POST localhost:8080/orders \
@@ -169,11 +173,13 @@ shows `order confirmation email sent`.
 | Send the identical request again     | `200`, the same order ID, and no second stock reservation | Client idempotency and stored-result replay |
 | Order 4 units of `SKU-SCARCE`        | `409` with the complete stock shortfall                   | Atomic inventory refusal                    |
 | Stop inventory, then submit an order | `503` after three attempts; the order remains `pending`   | Durable, resumable failure state            |
+| `docker compose stop rabbitmq`, submit an order, then `docker compose start rabbitmq` | `201` straight away; the email is logged once RabbitMQ is back | The outbox: acceptance does not wait for the broker, and the event is not lost |
 
 
 The automated tests target failure behavior: exhausted retries, stock contention,
 duplicate requests, state conflicts, unroutable publications, unknown publication
-outcomes, duplicate deliveries, expired claims, stale workers, and parking failures.
+outcomes, an acceptance whose event cannot be stored, outbox lease takeovers, duplicate
+deliveries, expired claims, stale workers, and parking failures.
 Concurrency tests release many goroutines against the same stock rows and assert the
 invariant—never `reserved > on_hand`—rather than requiring one particular winner.
 
@@ -185,9 +191,9 @@ make check             # Compose validation, Buf lint, go vet, and unit tests
 
 ## Deliberate limits
 
-- **No transactional outbox yet.** An accepted order can lose its event, and client
-replay does not republish it.
-- **No automatic recovery worker yet.** A `pending` order is resumed by a later request
+- **Events that need attention wait for a person.** They are logged as errors and listed
+by `make order-outbox-attention`, but nothing alerts on them, and redrive is manual.
+- **No automatic recovery for pending orders yet.** A `pending` order is resumed by a later request
 with the same idempotency key, but it can otherwise remain pending indefinitely.
 - **No reservation expiry or release.** A reservation can remain held when the order
 workflow fails after inventory succeeds.

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/postgres"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/domain"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/correlation"
 	platformdatabase "github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/database"
 )
 
@@ -79,6 +81,171 @@ func TestOrderRepositoryTranslatesDuplicateIdempotencyKey(t *testing.T) {
 	err := repository.Create(ctx, second)
 
 	require.ErrorIs(t, err, application.ErrDuplicateIdempotencyKey)
+}
+
+func TestOrderRepositoryAcceptsAnOrderAndRecordsItsEventTogether(t *testing.T) {
+	db := startPostgres(t, context.Background())
+	repository := postgres.NewOrderRepository(db)
+	ctx := correlation.WithRequestID(context.Background(), "request-1")
+
+	order := newTestOrder(t, "018f0f38-5a52-7a01-8000-000000000010", "accept-order")
+	require.NoError(t, repository.Create(ctx, order))
+	require.NoError(t, order.Accept(order.CreatedAt().Add(time.Minute)))
+
+	err := repository.UpdateAndRecordEvent(
+		ctx,
+		order,
+		domain.StatusPending,
+		acceptedEventFor(order, "018f0f38-5a52-7a01-8000-0000000000e1"),
+	)
+	require.NoError(t, err)
+
+	stored, err := repository.FindByID(ctx, order.ID())
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusAccepted, stored.Status())
+
+	var orderID, correlationID, status string
+	err = db.QueryRowContext(ctx, `
+		SELECT order_id, correlation_id, status
+		  FROM outbox_events
+		 WHERE event_id = '018f0f38-5a52-7a01-8000-0000000000e1'`,
+	).Scan(&orderID, &correlationID, &status)
+	require.NoError(t, err)
+	assert.Equal(t, string(order.ID()), orderID)
+	assert.Equal(t, "request-1", correlationID)
+	assert.Equal(t, "pending", status)
+}
+
+func TestOrderRepositoryRecordsNoEventWhenTheStateHasMoved(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	repository := postgres.NewOrderRepository(db)
+
+	order := newTestOrder(t, "018f0f38-5a52-7a01-8000-000000000010", "accept-order")
+	require.NoError(t, repository.Create(ctx, order))
+	require.NoError(t, order.Accept(order.CreatedAt().Add(time.Minute)))
+	require.NoError(t, repository.Update(ctx, order, domain.StatusPending))
+
+	err := repository.UpdateAndRecordEvent(
+		ctx,
+		order,
+		domain.StatusPending,
+		acceptedEventFor(order, "018f0f38-5a52-7a01-8000-0000000000e1"),
+	)
+
+	require.ErrorIs(t, err, application.ErrOrderStateConflict)
+	assert.Equal(t, 0, countOutboxEvents(t, db))
+}
+
+// The proof that the two writes are one transaction: the state change succeeds,
+// the event insert fails after it, and the state change must not survive.
+func TestOrderRepositoryRollsBackTheAcceptanceWhenTheEventCannotBeStored(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	repository := postgres.NewOrderRepository(db)
+	const sharedEventID = "018f0f38-5a52-7a01-8000-0000000000e1"
+
+	first := newTestOrder(t, "018f0f38-5a52-7a01-8000-000000000010", "first-order")
+	require.NoError(t, repository.Create(ctx, first))
+	require.NoError(t, first.Accept(first.CreatedAt().Add(time.Minute)))
+	require.NoError(t, repository.UpdateAndRecordEvent(
+		ctx, first, domain.StatusPending, acceptedEventFor(first, sharedEventID),
+	))
+
+	second := newTestOrder(t, "018f0f38-5a52-7a01-8000-000000000011", "second-order")
+	require.NoError(t, repository.Create(ctx, second))
+	require.NoError(t, second.Accept(second.CreatedAt().Add(time.Minute)))
+
+	err := repository.UpdateAndRecordEvent(
+		ctx, second, domain.StatusPending, acceptedEventFor(second, sharedEventID),
+	)
+	require.Error(t, err, "the event id is already taken")
+
+	stored, err := repository.FindByID(ctx, second.ID())
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusPending, stored.Status(), "the acceptance rolled back with the event")
+	assert.Equal(t, 1, countOutboxEvents(t, db))
+}
+
+func TestOrderRepositoryRecordsOneEventWhenTwoAcceptancesRace(t *testing.T) {
+	ctx := context.Background()
+	db := startPostgres(t, ctx)
+	repository := postgres.NewOrderRepository(db)
+
+	order := newTestOrder(t, "018f0f38-5a52-7a01-8000-000000000010", "raced-order")
+	require.NoError(t, repository.Create(ctx, order))
+
+	eventIDs := []string{
+		"018f0f38-5a52-7a01-8000-0000000000e1",
+		"018f0f38-5a52-7a01-8000-0000000000e2",
+	}
+	results := make([]error, len(eventIDs))
+
+	// Each racer loads its own copy while the order is still pending, as two
+	// requests would, and only then are both released to write.
+	racers := make([]*domain.Order, len(eventIDs))
+	for index := range racers {
+		racer, err := repository.FindByID(ctx, order.ID())
+		require.NoError(t, err)
+		require.NoError(t, racer.Accept(racer.CreatedAt().Add(time.Minute)))
+		racers[index] = racer
+	}
+
+	var start, finished sync.WaitGroup
+	start.Add(1)
+	for index, eventID := range eventIDs {
+		finished.Add(1)
+		go func() {
+			defer finished.Done()
+			start.Wait()
+
+			results[index] = repository.UpdateAndRecordEvent(
+				ctx, racers[index], domain.StatusPending, acceptedEventFor(racers[index], eventID),
+			)
+		}()
+	}
+	start.Done()
+	finished.Wait()
+
+	succeeded := 0
+	for _, err := range results {
+		if err == nil {
+			succeeded++
+			continue
+		}
+		assert.ErrorIs(t, err, application.ErrOrderStateConflict)
+	}
+	assert.Equal(t, 1, succeeded)
+	assert.Equal(t, 1, countOutboxEvents(t, db))
+}
+
+func acceptedEventFor(order *domain.Order, eventID string) application.OrderAcceptedEvent {
+	lines := make([]application.OrderAcceptedLine, 0)
+	for _, item := range order.OrderItems() {
+		lines = append(lines, application.OrderAcceptedLine{
+			ProductSKU: item.ProductSKU(),
+			Quantity:   item.Quantity(),
+			UnitPrice:  item.UnitPrice(),
+		})
+	}
+
+	return application.OrderAcceptedEvent{
+		EventID:       eventID,
+		OrderID:       order.ID(),
+		OccurredAt:    order.UpdatedAt(),
+		CustomerEmail: order.CustomerEmail(),
+		Total:         order.Total(),
+		Lines:         lines,
+	}
+}
+
+func countOutboxEvents(t *testing.T, db *sql.DB) int {
+	t.Helper()
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM outbox_events`).Scan(&count))
+
+	return count
 }
 
 func startPostgres(t *testing.T, ctx context.Context) *sql.DB {

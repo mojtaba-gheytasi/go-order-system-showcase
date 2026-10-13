@@ -15,7 +15,6 @@ import (
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/ordereventamqp"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/domain"
-	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/correlation"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/rabbitmq"
 )
 
@@ -23,9 +22,9 @@ var occurredAt = time.Date(2026, time.September, 13, 10, 30, 0, 0, time.UTC)
 
 func TestPublishOrderAcceptedSetsTheEnvelope(t *testing.T) {
 	messages := &fakeMessagePublisher{}
-	ctx := correlation.WithRequestID(context.Background(), "request-7")
 
-	err := ordereventamqp.NewPublisher(messages).PublishOrderAccepted(ctx, testEvent())
+	err := ordereventamqp.NewPublisher(messages).
+		PublishOrderAccepted(context.Background(), testEvent(), "request-7")
 	require.NoError(t, err)
 
 	require.Len(t, messages.published, 1)
@@ -54,7 +53,7 @@ func TestPublishOrderAcceptedEncodesEveryField(t *testing.T) {
 	messages := &fakeMessagePublisher{}
 
 	err := ordereventamqp.NewPublisher(messages).
-		PublishOrderAccepted(context.Background(), testEvent())
+		PublishOrderAccepted(context.Background(), testEvent(), "request-7")
 	require.NoError(t, err)
 
 	require.Len(t, messages.published, 1)
@@ -80,53 +79,43 @@ func TestPublishOrderAcceptedEncodesEveryField(t *testing.T) {
 	assert.Equal(t, int32(1), decoded.GetLines()[1].GetQuantity())
 }
 
-// The order is already durably accepted before this runs, so a client that hangs
-// up must not cancel the announcement of something that has already happened.
-func TestPublishOrderAcceptedSurvivesACancelledRequest(t *testing.T) {
-	messages := &fakeMessagePublisher{}
-	ctx, cancel := context.WithCancel(
-		correlation.WithRequestID(context.Background(), "request-9"),
-	)
-	cancel()
-
-	err := ordereventamqp.NewPublisher(messages).PublishOrderAccepted(ctx, testEvent())
-	require.NoError(t, err)
-
-	require.Len(t, messages.published, 1)
-	assert.NoError(t, messages.contexts[0].Err(), "the publish context must not be cancelled")
-
-	// Cancellation is dropped, the request id is not: it is the thread from a
-	// customer's order to the consumer's log line.
-	assert.Equal(t, "request-9", messages.published[0].CorrelationID)
-}
-
 func TestPublishOrderAcceptedWithoutARequestIDSendsNoCorrelation(t *testing.T) {
 	messages := &fakeMessagePublisher{}
 
 	err := ordereventamqp.NewPublisher(messages).
-		PublishOrderAccepted(context.Background(), testEvent())
+		PublishOrderAccepted(context.Background(), testEvent(), "")
 	require.NoError(t, err)
 
 	require.Len(t, messages.published, 1)
 	assert.Empty(t, messages.published[0].CorrelationID)
 }
 
-// The transport's verdict reaches the caller unchanged, so the use case can log
-// which of the three outcomes happened rather than just "failed".
+// The worker's retry policy depends on which outcome happened, so the transport's
+// verdict must survive, and the two it treats specially must be recognisable
+// without the worker knowing about RabbitMQ.
 func TestPublishOrderAcceptedReturnsTheTransportOutcome(t *testing.T) {
-	for name, outcome := range map[string]error{
-		"unroutable":  rabbitmq.ErrUnroutable,
-		"unavailable": rabbitmq.ErrUnavailable,
-		"rejected":    rabbitmq.ErrRejected,
-		"unknown":     rabbitmq.ErrOutcomeUnknown,
-	} {
+	tests := map[string]struct {
+		transport   error
+		application error
+	}{
+		"unavailable": {transport: rabbitmq.ErrUnavailable, application: application.ErrPublisherUnavailable},
+		"unknown":     {transport: rabbitmq.ErrOutcomeUnknown, application: application.ErrPublicationOutcomeUnknown},
+		"unroutable":  {transport: rabbitmq.ErrUnroutable},
+		"rejected":    {transport: rabbitmq.ErrRejected},
+	}
+
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			messages := &fakeMessagePublisher{err: outcome}
+			messages := &fakeMessagePublisher{err: test.transport}
 
 			err := ordereventamqp.NewPublisher(messages).
-				PublishOrderAccepted(context.Background(), testEvent())
+				PublishOrderAccepted(context.Background(), testEvent(), "request-7")
 
-			assert.ErrorIs(t, err, outcome)
+			assert.ErrorIs(t, err, test.transport)
+			if test.application != nil {
+				assert.ErrorIs(t, err, test.application)
+			}
+			assert.NotErrorIs(t, err, application.ErrEventUnpublishable)
 		})
 	}
 }
@@ -148,20 +137,15 @@ func testEvent() application.OrderAcceptedEvent {
 type fakeMessagePublisher struct {
 	err       error
 	published []rabbitmq.Message
-
-	// contexts records what the adapter passed down, so a test can assert that
-	// the request's cancellation was detached from it.
-	contexts []context.Context
 }
 
 var _ ordereventamqp.MessagePublisher = (*fakeMessagePublisher)(nil)
 
 func (publisher *fakeMessagePublisher) Publish(
-	ctx context.Context,
+	_ context.Context,
 	message rabbitmq.Message,
 ) error {
 	publisher.published = append(publisher.published, message)
-	publisher.contexts = append(publisher.contexts, ctx)
 
 	if publisher.err != nil {
 		// Wrapped, so the test checks that the sentinel survives the adapter

@@ -3,6 +3,7 @@ package ordereventamqp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"google.golang.org/protobuf/proto"
@@ -11,7 +12,6 @@ import (
 	orderv1 "github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/api/gen/order/v1"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/api/orderevents"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
-	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/correlation"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/rabbitmq"
 )
 
@@ -34,30 +34,33 @@ func NewPublisher(messages MessagePublisher) *Publisher {
 func (publisher *Publisher) PublishOrderAccepted(
 	ctx context.Context,
 	event application.OrderAcceptedEvent,
+	correlationID string,
 ) error {
 	body, err := proto.Marshal(protoOrderAccepted(event))
 	if err != nil {
-		return fmt.Errorf("marshal order accepted event: %w", err)
+		return fmt.Errorf("%w: marshal order accepted event: %w", application.ErrEventUnpublishable, err)
 	}
 
-	// Detached from the request's cancellation, deliberately. The order is
-	// already durably accepted; a client that hangs up must not cancel the
-	// announcement of a fact that has already happened. The publish timeout still
-	// bounds it, so this cannot hang.
-	//
-	// WithoutCancel rather than a fresh context, because the request id lives in
-	// there and is what ties this publication to the order that caused it.
-	publishCtx := context.WithoutCancel(ctx)
-
-	return publisher.messages.Publish(publishCtx, rabbitmq.Message{
+	err = publisher.messages.Publish(ctx, rabbitmq.Message{
 		Exchange:      orderevents.ExchangeOrders,
 		RoutingKey:    orderevents.RoutingKeyOrderAccepted,
 		Type:          orderevents.MessageTypeOrderAccepted,
 		ContentType:   orderevents.ContentTypeProtobuf,
 		MessageID:     event.EventID,
-		CorrelationID: correlation.FromContext(ctx),
+		CorrelationID: correlationID,
 		Body:          body,
 	})
+
+	// Only the two outcomes the worker treats differently are translated. Not
+	// routed and rejected both mean "this attempt failed", which is the default.
+	switch {
+	case errors.Is(err, rabbitmq.ErrUnavailable):
+		return fmt.Errorf("%w: %w", application.ErrPublisherUnavailable, err)
+	case errors.Is(err, rabbitmq.ErrOutcomeUnknown):
+		return fmt.Errorf("%w: %w", application.ErrPublicationOutcomeUnknown, err)
+	default:
+		return err
+	}
 }
 
 // protoOrderAccepted maps the application's snapshot onto the wire type.

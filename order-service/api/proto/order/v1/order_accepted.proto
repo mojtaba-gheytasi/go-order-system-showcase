@@ -8,20 +8,19 @@ option go_package = "github.com/mojtaba-gheytasi/go-order-system-showcase/order-
 
 // OrderAccepted announces that an order reached the accepted state.
 //
-// Published once by order-service to the "orders" topic exchange with routing key
-// "order.accepted.v1", immediately after the transition from pending to accepted was
-// committed. Both names are constants in this module's orderevents package.
+// Published by order-service to the "orders" topic exchange with routing key
+// "order.accepted.v1", after the transition from pending to accepted was committed.
+// Both names are constants in this module's orderevents package.
 //
 // NAME. The accepted order state was durably committed before this event was published.
-// That is a statement about the order, not the event: the event itself can still be
-// lost. An order is created as pending well before this point.
+// An order is created as pending well before this point.
 //
-// DELIVERY. Best-effort publication; at-least-once processing only after the event has
-// been routed into a queue. There is no transactional outbox, so publication is not
-// atomic with the state change: a publish can be refused as unroutable, succeed, or end
-// with an unknown outcome when a confirm times out. Nothing reconciles or republishes
-// it. Never read the absence of an event as proof that no order was accepted, and
-// tolerate receiving the same event twice.
+// DELIVERY. At-least-once publication; at-least-once processing once routed into a
+// queue. The event is saved in an outbox in the same transaction as the acceptance and
+// published later, in the background, so it can arrive a while after the order was
+// accepted. An unknown publication outcome is retried, so the same event, with the same
+// event_id, can arrive more than once. An event whose retries are used up is kept for a
+// manual redrive rather than dropped. Tolerate duplicates and late arrivals.
 //
 // COMPATIBILITY. Field numbers are never reused or renumbered; deletions are reserved.
 // Adding a field is binary-wire-safe, which is not the same as harmless: ignore fields

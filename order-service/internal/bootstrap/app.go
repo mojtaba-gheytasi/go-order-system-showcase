@@ -18,6 +18,7 @@ import (
 
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/api/orderevents"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/adapter/outbound/inventorygrpc"
+	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/application"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/order/wiring"
 	"github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/config"
 	platformdatabase "github.com/mojtaba-gheytasi/go-order-system-showcase/order-service/internal/platform/database"
@@ -31,6 +32,7 @@ type App struct {
 	db             *sql.DB
 	inventoryConn  *grpc.ClientConn
 	eventPublisher *rabbitmq.Publisher
+	eventWorker    *application.PublishOrderEvents
 	server         *httpserver.Server
 }
 
@@ -69,8 +71,7 @@ func New(
 
 	// Like the gRPC client above, this does not connect here. It dials on its
 	// first publication and redials after a failure, so a broker that is down
-	// delays nothing at startup and fails only the announcements themselves —
-	// which are best-effort by design.
+	// delays nothing at startup. Events wait in the outbox until it is back.
 	//
 	// The exchange is declared from the contract's own constants rather than from
 	// configuration. Its name and settings are part of what order-service
@@ -79,6 +80,7 @@ func New(
 		rabbitmq.Config{
 			URL:            applicationConfig.RabbitMQURL,
 			PublishTimeout: applicationConfig.RabbitMQPublishTimeout,
+			DialTimeout:    applicationConfig.RabbitMQPublishTimeout,
 			ReconnectDelay: applicationConfig.RabbitMQReconnectDelay,
 			Exchanges: []rabbitmq.ExchangeDeclaration{{
 				Name:       orderevents.ExchangeOrders,
@@ -92,13 +94,15 @@ func New(
 	)
 
 	orderModule, err := wiring.New(wiring.Dependencies{
-		DB:               db,
-		Logger:           logger,
-		Clock:            func() time.Time { return time.Now().UTC() },
-		NewID:            newIDGenerator(logger),
-		InventoryConn:    inventoryConn,
-		InventoryTimeout: applicationConfig.InventoryGRPCTimeout,
-		EventPublisher:   eventPublisher,
+		DB:                 db,
+		Logger:             logger,
+		Clock:              func() time.Time { return time.Now().UTC() },
+		NewID:              newIDGenerator(logger),
+		InventoryConn:      inventoryConn,
+		InventoryTimeout:   applicationConfig.InventoryGRPCTimeout,
+		EventPublisher:     eventPublisher,
+		OutboxPollInterval: applicationConfig.OutboxPollInterval,
+		OutboxLease:        applicationConfig.OutboxClaimLease,
 	})
 	if err != nil {
 		// No App is returned, so nobody will close these.
@@ -115,6 +119,7 @@ func New(
 		db:             db,
 		inventoryConn:  inventoryConn,
 		eventPublisher: eventPublisher,
+		eventWorker:    orderModule.EventWorker,
 		server: httpserver.NewServer(
 			httpserver.Config{
 				Address:           applicationConfig.HTTPServerAddress,
@@ -148,13 +153,21 @@ func (app *App) Start() error {
 	return app.server.Start()
 }
 
+// RunEventWorker publishes stored events until ctx is cancelled. Close must not
+// be called until it has returned: it uses the database and the publisher.
+func (app *App) RunEventWorker(ctx context.Context) {
+	app.logger.Info().Msg("event worker started")
+	app.eventWorker.Run(ctx)
+	app.logger.Info().Msg("event worker stopped")
+}
+
 // Shutdown drains in-flight requests, bounded by ctx.
 func (app *App) Shutdown(ctx context.Context) error {
 	return app.server.Shutdown(ctx)
 }
 
-// Close releases the resources New acquired. Call it after Shutdown, so that
-// requests still draining can finish the calls they are in the middle of.
+// Close releases the resources New acquired. Call it after Shutdown and after
+// RunEventWorker has returned, so nothing is still using them.
 //
 // errors.Join rather than an early return: a failure closing any one of these
 // must not leave the others open.

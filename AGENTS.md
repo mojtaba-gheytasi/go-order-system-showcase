@@ -137,11 +137,15 @@ rules, because an event has any number of consumers and a command has exactly on
 Declaring a broker object is not owning it — both sides declare the `orders` exchange so
 either can start first.
 
-**The delivery guarantee is "best-effort publication, at-least-once processing once
-routed."** There is no outbox, so an accepted order's event can be lost. Never write, in
-code or docs, that a failed publish means no email is sent: a confirm timeout leaves the
-outcome genuinely *unknown*. A publish has three outcomes (routed / known-not-routed via
-`mandatory` + `basic.return` / unknown), never two.
+**The delivery guarantee is "at-least-once publication, at-least-once processing once
+routed."** The event is saved in `outbox_events` in the same transaction as the
+acceptance, and a background worker publishes it. An unknown outcome is retried, so
+duplicates are expected; never call publication exactly once. Retries stop only by
+marking the event `needs_attention`, which keeps it for a manual redrive. The retry
+budget counts only attempts that reached the broker: an outage pauses the worker
+instead. Never write, in code or docs, that a failed publish means no email is sent: a
+confirm timeout leaves the outcome genuinely *unknown*. A publish has three outcomes
+(routed / known-not-routed via `mandatory` + `basic.return` / unknown), never two.
 
 **Deduplication is of the effect, not the message.** The key is
 `(subject_id, notification_kind, channel)`, not `event_id`, and the claim is a fenced lease —

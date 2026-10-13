@@ -21,9 +21,9 @@ services:
       inventory:
         condition: service_started
       # Waiting for a healthy broker here is a convenience for development, not a
-      # requirement: order-service starts and serves without one, and publishing
-      # is best-effort. It means `make up` does not greet you with a warning about
-      # an unreachable broker on the first order.
+      # requirement: order-service starts and serves without one, and accepted
+      # orders' events wait in the outbox until the broker is reachable. It means
+      # `make up` does not greet you with a warning about an unreachable broker.
       rabbitmq:
         condition: service_healthy
     ports:

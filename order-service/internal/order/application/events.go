@@ -10,8 +10,7 @@ import (
 //
 // Deliberately not the aggregate: a published event is a contract and the aggregate is
 // not, EventID and OccurredAt are captured once so a retry announces the same fact, and
-// an outbox will need a serialisable value the use case can write inside the order's
-// transaction.
+// the outbox stores this value inside the order's transaction.
 type OrderAcceptedEvent struct {
 	EventID       string
 	OrderID       domain.OrderID

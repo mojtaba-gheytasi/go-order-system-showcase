@@ -3,11 +3,9 @@ package application_test
 import (
 	"context"
 	"errors"
-	"io"
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -22,7 +20,7 @@ var (
 	testIdempotencyKey = "create-order-1"
 )
 
-func TestCreateOrderPersistsPendingBeforeInventoryThenAcceptsAndPublishes(t *testing.T) {
+func TestCreateOrderPersistsPendingBeforeInventoryThenAcceptsWithItsEvent(t *testing.T) {
 	dependencies := newDependencies()
 
 	result, err := dependencies.useCase().Execute(context.Background(), testCommand())
@@ -39,14 +37,13 @@ func TestCreateOrderPersistsPendingBeforeInventoryThenAcceptsAndPublishes(t *tes
 	assert.Equal(t, domain.StatusPending, dependencies.repository.expectedStatus)
 	assert.Equal(t, 1, dependencies.repository.createCalls)
 	assert.Equal(t, 1, dependencies.repository.updateCalls)
-	assert.Equal(t, 1, dependencies.events.calls)
+	require.Len(t, dependencies.repository.recordedEvents, 1, "the acceptance carries its event")
 
 	created := dependencies.trace.index("create")
 	reserved := dependencies.trace.index("reserve")
 	require.NotEqual(t, -1, created)
 	require.NotEqual(t, -1, reserved)
 	assert.Less(t, created, reserved, "pending must be persisted before inventory is called")
-	assert.Less(t, dependencies.trace.index("update"), dependencies.trace.index("publish"))
 
 	require.Len(t, dependencies.reserver.requests, 1)
 	request := dependencies.reserver.requests[0]
@@ -86,7 +83,7 @@ func TestCreateOrderReturnsAcceptedReplayWithoutExternalCalls(t *testing.T) {
 	assert.Equal(t, 0, dependencies.reserver.calls)
 	assert.Equal(t, 0, dependencies.repository.createCalls)
 	assert.Equal(t, 0, dependencies.repository.updateCalls)
-	assert.Equal(t, 0, dependencies.events.calls)
+	assert.Empty(t, dependencies.repository.recordedEvents)
 }
 
 func TestCreateOrderReturnsRejectedReplayWithoutExternalCalls(t *testing.T) {
@@ -103,7 +100,7 @@ func TestCreateOrderReturnsRejectedReplayWithoutExternalCalls(t *testing.T) {
 	assert.Equal(t, 0, dependencies.catalog.calls)
 	assert.Equal(t, 0, dependencies.reserver.calls)
 	assert.Equal(t, 0, dependencies.repository.updateCalls)
-	assert.Equal(t, 0, dependencies.events.calls)
+	assert.Empty(t, dependencies.repository.recordedEvents)
 }
 
 func TestCreateOrderPendingReplayUsesPersistedOrderSnapshot(t *testing.T) {
@@ -197,7 +194,7 @@ func TestCreateOrderStopsAfterThreeUnavailableInventoryAttemptsAndLeavesPending(
 	assert.Equal(t, 3, dependencies.reserver.calls)
 	assert.Equal(t, domain.StatusPending, dependencies.repository.statusAtCreate)
 	assert.Equal(t, 0, dependencies.repository.updateCalls)
-	assert.Equal(t, 0, dependencies.events.calls)
+	assert.Empty(t, dependencies.repository.recordedEvents)
 }
 
 func TestCreateOrderDoesNotRetryInsufficientStockAndPersistsRejected(t *testing.T) {
@@ -211,7 +208,7 @@ func TestCreateOrderDoesNotRetryInsufficientStockAndPersistsRejected(t *testing.
 	assert.Equal(t, 1, dependencies.repository.updateCalls)
 	assert.Equal(t, domain.StatusRejected, dependencies.repository.statusAtUpdate)
 	assert.Equal(t, domain.StatusPending, dependencies.repository.expectedStatus)
-	assert.Equal(t, 0, dependencies.events.calls)
+	assert.Empty(t, dependencies.repository.recordedEvents, "a rejection announces nothing")
 }
 
 // The order is stored as rejected either way, but what inventory said about the
@@ -290,7 +287,6 @@ func TestCreateOrderAttemptsStatePersistenceOnlyOnce(t *testing.T) {
 			_, err := dependencies.useCase().Execute(context.Background(), testCommand())
 			require.ErrorIs(t, err, databaseError)
 			assert.Equal(t, 1, dependencies.repository.updateCalls)
-			assert.Equal(t, 0, dependencies.events.calls)
 		})
 	}
 }
@@ -311,7 +307,6 @@ func TestCreateOrderReloadsTheWinningStateAfterAConflict(t *testing.T) {
 	assert.Same(t, winner, result.Order)
 	assert.Equal(t, 1, dependencies.repository.updateCalls)
 	assert.Equal(t, 1, dependencies.repository.findByIDCalls)
-	assert.Equal(t, 0, dependencies.events.calls, "only the request that stores acceptance publishes")
 }
 
 func TestCreateOrderPropagatesCatalogFailures(t *testing.T) {
@@ -372,19 +367,45 @@ func TestCreateOrderDoesNotCallInventoryWhenInitialPersistenceFails(t *testing.T
 
 	require.ErrorIs(t, err, failure)
 	assert.Equal(t, 0, dependencies.reserver.calls)
-	assert.Equal(t, 0, dependencies.events.calls)
 }
 
-func TestCreateOrderSucceedsWhenPublicationFails(t *testing.T) {
+// The event is a published contract, so what it says is worth asserting on, not
+// merely that one was recorded.
+func TestCreateOrderRecordsTheAcceptanceSnapshotAsItsEvent(t *testing.T) {
 	dependencies := newDependencies()
-	dependencies.events.err = errors.New("broker unavailable")
 
 	result, err := dependencies.useCase().Execute(context.Background(), testCommand())
-
 	require.NoError(t, err)
-	assert.True(t, result.Created)
-	assert.Equal(t, domain.StatusAccepted, result.Order.Status())
-	assert.Equal(t, 1, dependencies.events.calls)
+
+	require.Len(t, dependencies.repository.recordedEvents, 1)
+	event := dependencies.repository.recordedEvents[0]
+	assert.Equal(t, generatedID, event.EventID)
+	assert.Equal(t, result.Order.ID(), event.OrderID)
+	assert.Equal(t, result.Order.UpdatedAt(), event.OccurredAt, "the acceptance instant, not a later clock reading")
+	assert.Equal(t, "customer@example.com", event.CustomerEmail)
+	assert.Equal(t, domain.Money{AmountInCents: 3000, Currency: "EUR"}, event.Total)
+	assert.ElementsMatch(t, []application.OrderAcceptedLine{
+		{ProductSKU: "SKU-A", Quantity: 2, UnitPrice: domain.Money{AmountInCents: 1250, Currency: "EUR"}},
+		{ProductSKU: "SKU-B", Quantity: 1, UnitPrice: domain.Money{AmountInCents: 500, Currency: "EUR"}},
+	}, event.Lines)
+}
+
+// A lost race on the accepting write stores nothing, so the winner's event is the
+// only one.
+func TestCreateOrderRecordsNoEventWhenTheAcceptanceLosesARace(t *testing.T) {
+	dependencies := newDependencies()
+	winner := acceptedOrder(t, domain.OrderID(generatedID), testIdempotencyKey, "SKU-A")
+	dependencies.repository.update = func(context.Context, *domain.Order, domain.Status) error {
+		return application.ErrOrderStateConflict
+	}
+	dependencies.repository.findByID = func(context.Context, domain.OrderID) (*domain.Order, error) {
+		return winner, nil
+	}
+
+	_, err := dependencies.useCase().Execute(context.Background(), testCommand())
+	require.NoError(t, err)
+
+	assert.Empty(t, dependencies.repository.recordedEvents)
 }
 
 func TestCreateOrderRejectsAnInvalidCommandBeforePersistence(t *testing.T) {
@@ -471,7 +492,6 @@ type dependencies struct {
 	repository *fakeRepository
 	catalog    *fakeCatalog
 	reserver   *fakeReserver
-	events     *fakeEventPublisher
 	trace      *callTrace
 }
 
@@ -485,7 +505,6 @@ func newDependencies() *dependencies {
 			"SKU-B": {AmountInCents: 500, Currency: "EUR"},
 		}},
 		reserver: &fakeReserver{trace: trace},
-		events:   &fakeEventPublisher{trace: trace},
 		trace:    trace,
 	}
 }
@@ -495,10 +514,8 @@ func (d *dependencies) useCase() *application.CreateOrder {
 		d.repository,
 		d.catalog,
 		d.reserver,
-		d.events,
 		func() time.Time { return fixedNow },
 		func() string { return generatedID },
-		zerolog.New(io.Discard),
 	)
 }
 
@@ -535,6 +552,10 @@ type fakeRepository struct {
 	statusAtCreate domain.Status
 	statusAtUpdate domain.Status
 	expectedStatus domain.Status
+
+	// recordedEvents holds only events whose write succeeded, as the real
+	// transaction would.
+	recordedEvents []application.OrderAcceptedEvent
 }
 
 var _ application.OrderRepository = (*fakeRepository)(nil)
@@ -564,6 +585,23 @@ func (repository *fakeRepository) Update(
 	if repository.update != nil {
 		return repository.update(ctx, order, expectedStatus)
 	}
+
+	return nil
+}
+
+// UpdateAndRecordEvent shares Update's hook and counters: it is the same state
+// write, with an event riding along.
+func (repository *fakeRepository) UpdateAndRecordEvent(
+	ctx context.Context,
+	order *domain.Order,
+	expectedStatus domain.Status,
+	event application.OrderAcceptedEvent,
+) error {
+	if err := repository.Update(ctx, order, expectedStatus); err != nil {
+		return err
+	}
+
+	repository.recordedEvents = append(repository.recordedEvents, event)
 
 	return nil
 }
@@ -622,27 +660,4 @@ func (reserver *fakeReserver) Reserve(
 	}
 
 	return nil
-}
-
-type fakeEventPublisher struct {
-	trace *callTrace
-	err   error
-	calls int
-
-	// published keeps what was announced, not merely that something was. The
-	// event is a published contract, so its contents are worth asserting on.
-	published []application.OrderAcceptedEvent
-}
-
-var _ application.OrderEventPublisher = (*fakeEventPublisher)(nil)
-
-func (publisher *fakeEventPublisher) PublishOrderAccepted(
-	_ context.Context,
-	event application.OrderAcceptedEvent,
-) error {
-	publisher.trace.record("publish")
-	publisher.calls++
-	publisher.published = append(publisher.published, event)
-
-	return publisher.err
 }
