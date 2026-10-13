@@ -44,6 +44,7 @@ export NOTIFICATION_ENV_FILE NOTIFICATION_DB_NAME NOTIFICATION_DB_USER \
 
 .PHONY: help dev up down stop ps \
 	order-logs order-shell order-db-logs order-db-shell order-db-ready \
+	order-outbox-attention order-outbox-redrive \
 	order-migrate-up order-migrate-down order-migrate-create sqlvet \
 	inventory-logs inventory-shell inventory-db-logs inventory-db-shell inventory-db-ready \
 	inventory-migrate-up inventory-migrate-down inventory-migrate-create inventory-seed \
@@ -89,6 +90,15 @@ order-db-shell: ## Open psql in the order database
 order-db-ready: ## Check whether the order database accepts connections
 	$(COMPOSE) exec order-postgres pg_isready -U $(ORDER_DB_USER) -d $(ORDER_DB_NAME)
 
+order-outbox-attention: ## List order events whose automatic publication stopped
+	$(COMPOSE) exec order-postgres psql -U $(ORDER_DB_USER) -d $(ORDER_DB_NAME) -c \
+		"SELECT event_id, order_id, attempts, needs_attention_at, last_error FROM outbox_events WHERE status = 'needs_attention' ORDER BY needs_attention_at"
+
+# Only after the cause is fixed: a redriven event starts a fresh retry budget.
+order-outbox-redrive: ## Retry events that need attention; optionally id=<event_id>
+	$(COMPOSE) exec order-postgres psql -U $(ORDER_DB_USER) -d $(ORDER_DB_NAME) -c \
+		"UPDATE outbox_events SET status = 'pending', attempts = 0, next_attempt_at = now(), needs_attention_at = NULL WHERE status = 'needs_attention'$(if $(id), AND event_id = '$(id)')"
+
 order-migrate-up: ## Apply every pending order database migration
 	migrate -path $(ORDER_DIR)/migrations -database "$(ORDER_DATABASE_URL)" up
 
@@ -99,7 +109,9 @@ order-migrate-create: ## Create order migration files; usage: make order-migrate
 	@test -n "$(name)" || (echo "name is required; usage: make order-migrate-create name=add_column" && exit 1)
 	migrate create -ext sql -dir $(ORDER_DIR)/migrations -seq $(name)
 
+# sqlvet reads one schema file, so every migration is joined into one first.
 sqlvet: ## Validate order-service SQL against its schema
+	cat $(ORDER_DIR)/migrations/*.up.sql > $(ORDER_DIR)/.sqlvet-schema.sql
 	cd $(ORDER_DIR) && sqlvet .
 
 # --- inventory-service ------------------------------------------------------

@@ -1,1 +1,1 @@
-schema_path = "migrations/000001_create_orders.up.sql"
+schema_path = ".sqlvet-schema.sql"
